@@ -1,0 +1,54 @@
+
+DELETE  http://localhost:8000/tasks/0b16dc17-846d-481d-8850-49813b146f75
+Accept: application/json
+
+
+###
+//field=eq/gt/lt/gte/lte:30
+
+GET http://localhost:8000/tasks/a5f450ed-0498-438b-8a1f-f02974517ff7
+Accept: application/json
+
+###
+//v1/users/:userId/tags/:tagsId/tasks
+GET http://localhost:8000/v1/users/f33fd07e-86b5-44c8-a591-cf52492501f1/tags/43128de8-2f36-4690-a6ce-d62439476cd7/tasks
+Accept: application/json
+
+###
+
+POST http://localhost:8000/v1/users/f33fd07e-86b5-44c8-a591-cf52492501f1/tags
+Content-Type: application/json
+
+{
+  "name": "test"
+}
+
+###
+
+POST http://localhost:8000/v1/users/ff0305bf-f2cf-4c3f-bbed-aed123393135/tasks
+Content-Type: application/json
+
+{
+  "title": "ТЕСТ",
+  "description": "ТЕСТ 2",
+  "status": "not_completed",
+  "priory": "green",
+  "due_date": "2025-03-01 15:40",
+  "tag_id": "1d1417c3-6792-42c1-94cd-77ef98c063d7"
+}
+
+###
+
+PATCH http://localhost:8000/tasks/6d2d4e0d-da5d-443e-abcd-956bd3fc50cf
+Accept: application/json
+
+{
+  "title": "TЕСТ228"
+}
+
+###
+
+GET http://localhost:8000/v1/users/f33fd07e-86b5-44c8-a591-cf52492501f1/tags/72bf5def-431f-45fc-9fe2-725974e45460
+Accept: application/json
+
+###

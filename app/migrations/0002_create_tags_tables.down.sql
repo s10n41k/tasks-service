@@ -1,0 +1,2 @@
+DROP TABLE IF EXISTS custom_tag;
+DROP TABLE IF EXISTS default_tag;

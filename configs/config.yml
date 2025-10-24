@@ -1,0 +1,10 @@
+listen:
+  type: ""
+  port: ""
+  bindIP: ""
+storagePostgresTasks:
+  host: localhost
+  port: 4000
+  database: mydatabase1
+  username: user1
+  password: password1

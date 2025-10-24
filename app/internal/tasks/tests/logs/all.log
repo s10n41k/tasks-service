@@ -1,0 +1,8 @@
+time="2025-07-02T18:48:21+03:00" level=info func="TODOLIST_Tasks/app/internal/config.GetConfig.func1()" file="config.go:65"
+time="2025-07-02T18:48:21+03:00" level=error msg="failed to read configerr=open : The system cannot find the file specified. path=" func="TODOLIST_Tasks/app/internal/config.GetConfig.func1()" file="config.go:66"
+time="2025-07-02T18:56:14+03:00" level=info func="TODOLIST_Tasks/app/internal/config.GetConfig.func1()" file="config.go:65"
+time="2025-07-02T18:56:14+03:00" level=error msg="failed to read configerr=open : The system cannot find the file specified. path=" func="TODOLIST_Tasks/app/internal/config.GetConfig.func1()" file="config.go:66"
+time="2025-07-02T18:58:39+03:00" level=info func="TODOLIST_Tasks/app/internal/config.GetConfig.func1()" file="config.go:65"
+time="2025-07-02T18:58:39+03:00" level=error msg="failed to read configerr=open : The system cannot find the file specified. path=" func="TODOLIST_Tasks/app/internal/config.GetConfig.func1()" file="config.go:66"
+time="2025-07-02T19:32:42+03:00" level=info func="TODOLIST_Tasks/app/internal/config.GetConfig.func1()" file="config.go:65"
+time="2025-07-02T19:32:42+03:00" level=error msg="failed to read configerr=open : The system cannot find the file specified. path=" func="TODOLIST_Tasks/app/internal/config.GetConfig.func1()" file="config.go:66"
