@@ -1,0 +1,1 @@
+TRUNCATE TABLE default_tag;
