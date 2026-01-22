@@ -1,5 +1,5 @@
 
-DELETE  http://localhost:8000/tasks/0b16dc17-846d-481d-8850-49813b146f75
+DELETE  http://localhost:8000/tasks/871821e7-09f9-43a8-a9aa-23bd7bf05935
 Accept: application/json
 
 
@@ -31,15 +31,15 @@ Content-Type: application/json
 {
   "title": "ТЕСТ",
   "description": "ТЕСТ 2",
-  "status": "not_completed",
-  "priory": "green",
-  "due_date": "2025-03-01 15:40",
+  "status": "in_progress",
+  "priory": "blue",
+  "due_date": "2025-05-02 15:59",
   "tag_id": "1d1417c3-6792-42c1-94cd-77ef98c063d7"
 }
 
 ###
 
-PATCH http://localhost:8000/tasks/6d2d4e0d-da5d-443e-abcd-956bd3fc50cf
+PATCH http://localhost:8000/tasks/db238fd2-3ee0-43be-a592-98a07459a54f
 Accept: application/json
 
 {

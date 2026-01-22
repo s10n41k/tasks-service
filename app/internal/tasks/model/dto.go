@@ -76,3 +76,21 @@ func (t *TaskCreateDTO) UnmarshalJSON(data []byte) error {
 
 	return nil
 }
+
+type Event struct {
+	ID            string          `db:"id"`
+	AggregateType string          `db:"aggregate_type"`
+	AggregateID   string          `db:"aggregate_id"`
+	EventType     string          `db:"event_type"`
+	EventData     json.RawMessage `db:"event_data"`
+	CreatedAt     time.Time       `db:"created_at"`
+	ProcessedAt   *time.Time      `db:"processed_at"`
+	Attempts      int             `db:"attempts"`
+	LastError     *string         `db:"last_error"`
+}
+
+type EventTask struct {
+	Task      Task      `json:"task"`
+	Type      string    `json:"type"`
+	Timestamp time.Time `json:"timestamp"`
+}

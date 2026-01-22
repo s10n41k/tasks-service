@@ -13,6 +13,7 @@ type Config struct {
 	ListenConfig          ListenConfig         `yaml:"listen"`
 	StoragePostgresConfig StoragePostgresTasks `yaml:"storagePostgresTasks"`
 	StorageRedisConfig    StorageRedisTasks    `yaml:"storageRedisTasks"`
+	KafkaConfig           KafkaConfig          `yaml:"kafkaTasks"`
 }
 
 type ListenConfig struct {
@@ -35,6 +36,10 @@ type StorageRedisTasks struct {
 	Username string
 	Password string `yaml:"password" env-default:"yourpassword"`
 	Protocol string `yaml:"protocol" env-default:"tcp"`
+}
+type KafkaConfig struct {
+	Brokers []string `yaml:"brokers" env-default:"localhost:4500"`
+	GroupID string   `yaml:"group_id" env-default:"tasks-service-group"`
 }
 
 const (

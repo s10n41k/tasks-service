@@ -2,7 +2,6 @@ package service
 
 import (
 	storage2 "TODOLIST_Tasks/app/internal/tags/storage"
-	"TODOLIST_Tasks/app/internal/tasks/event"
 	"TODOLIST_Tasks/app/internal/tasks/model"
 	model2 "TODOLIST_Tasks/app/internal/tasks/storage/model"
 	"TODOLIST_Tasks/app/internal/tasks/storage/postgres"
@@ -14,19 +13,17 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"time"
 )
 
 type Service struct {
 	RepositoryTasks postgres.Repository
 	RepositoryTags  storage2.Repository
 	RepositoryRedis redis.Repository
-	RepositoryKafka event.Repository
 	Logger          *logging2.Logger
 }
 
-func NewService(repositoryTasks postgres.Repository, repositoryTags storage2.Repository, repositoryRedis redis.Repository, repositoryKafka event.Repository) *Service {
-	return &Service{RepositoryTasks: repositoryTasks, RepositoryTags: repositoryTags, RepositoryRedis: repositoryRedis, RepositoryKafka: repositoryKafka, Logger: logging2.GetLogger().GetLoggerWithField("service", "tasks")}
+func NewService(repositoryTasks postgres.Repository, repositoryTags storage2.Repository, repositoryRedis redis.Repository) *Service {
+	return &Service{RepositoryTasks: repositoryTasks, RepositoryTags: repositoryTags, RepositoryRedis: repositoryRedis, Logger: logging2.GetLogger().GetLoggerWithField("service", "tasks")}
 }
 
 func (s *Service) FindOneRedis(ctx context.Context, id string) (model.Task, error) {
@@ -63,55 +60,52 @@ func (s *Service) UpdateTaskRedis(ctx context.Context, task model.Task) error {
 }
 
 func (s *Service) CreateTask(ctx context.Context, task model.Task) (model.Task, error) {
-
+	// Проверка тега
 	if task.TagID != "" {
 		tag, err := s.RepositoryTags.FindOneTags(ctx, task.TagID, task.UserID)
 		if err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				return model.Task{}, fmt.Errorf("тег с ID %s не найден", task.TagID)
 			}
-			return model.Task{}, fmt.Errorf("ошибка при поиске тега по ID: %w", err)
+			return model.Task{}, fmt.Errorf("ошибка при поиске тега: %w", err)
 		}
 		task.TagsName = tag.Name
 	}
 
-	// Создаем задачу
+	// Создание в Postgres (теперь в репозитории автоматически сохраняется в outbox)
 	taskID, err := s.RepositoryTasks.CreateTask(ctx, task)
 	if err != nil {
-		return model.Task{}, fmt.Errorf("ошибка при создании задачи: %w", err)
+		return model.Task{}, fmt.Errorf("ошибка создания задачи: %w", err)
 	}
 
 	taskResult, err := s.RepositoryTasks.FindOneTask(ctx, taskID)
 	if err != nil {
-		return model.Task{}, fmt.Errorf("ошибка при поиске задачи: %w", err)
+		return model.Task{}, fmt.Errorf("ошибка поиска задачи: %w", err)
 	}
-	go func(task model.Task) {
-		for i := 0; i < 3; i++ {
-			if err = s.RepositoryKafka.TaskCreated(context.Background(), task); err == nil {
-				s.Logger.Errorf("Ошибка при записи в Кафку: %v", err)
-			}
-			time.Sleep(500 * time.Millisecond)
-		}
-	}(taskResult)
 
+	s.Logger.Infof("Task %s created successfully", taskResult.Id)
 	return taskResult, nil
 }
 
 func (s *Service) UpdateTask(ctx context.Context, id string, task model.TaskUpdateDTO) (model.Task, error) {
-
+	// Обновление в Postgres (теперь в репозитории автоматически сохраняется в outbox)
 	result, err := s.RepositoryTasks.UpdateTask(ctx, id, task)
 	if err != nil {
-		return model.Task{}, err
+		return model.Task{}, fmt.Errorf("ошибка обновления задачи: %w", err)
 	}
+
+	s.Logger.Infof("Task %s updated successfully", id)
 	return result, nil
 }
 
 func (s *Service) DeleteTask(ctx context.Context, id string) (string, error) {
-
+	// Удаление в Postgres (теперь в репозитории автоматически сохраняется в outbox)
 	result, err := s.RepositoryTasks.DeleteTask(ctx, id)
 	if err != nil {
-		return "Couldn't delete a task", err
+		return "", fmt.Errorf("ошибка удаления задачи: %w", err)
 	}
+
+	s.Logger.Infof("Task %s deleted successfully", id)
 	return result, nil
 }
 
