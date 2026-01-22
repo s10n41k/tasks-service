@@ -6,13 +6,16 @@ import (
 	redis3 "TODOLIST_Tasks/app/internal/tags/db/redis"
 	handlers2 "TODOLIST_Tasks/app/internal/tags/handlers"
 	service2 "TODOLIST_Tasks/app/internal/tags/service"
+	"TODOLIST_Tasks/app/internal/tasks/db/outbox"
 	"TODOLIST_Tasks/app/internal/tasks/db/postgres"
 	redis2 "TODOLIST_Tasks/app/internal/tasks/db/redis"
+	kafka2 "TODOLIST_Tasks/app/internal/tasks/event/kafka"
 	"TODOLIST_Tasks/app/internal/tasks/handlers"
 	"TODOLIST_Tasks/app/internal/tasks/service"
+	"TODOLIST_Tasks/app/internal/worker"
+	"TODOLIST_Tasks/app/pkg/client/kafka"
 	postgresql "TODOLIST_Tasks/app/pkg/client/postgres"
 	"TODOLIST_Tasks/app/pkg/client/redis"
-	"TODOLIST_Tasks/app/pkg/client/users"
 	"TODOLIST_Tasks/app/pkg/logging"
 	"context"
 	"errors"
@@ -56,26 +59,38 @@ func main() {
 		}
 	}()
 
-	usersClient := users.New("http://localhost:3000")
+	clientKafka, err := kafka.NewClient(cfg.KafkaConfig)
+	if err != nil {
+		logger.Fatal(err)
+	}
+	defer func() {
+		if err := clientKafka.Close(); err != nil {
+			logger.Errorf("failed to close kafka connection: %v", err)
+			logger.Info("Kafka is closed")
+		}
+	}()
 
 	// Инициализация репозиториев и сервисов
 	repositoryRedisTasks := redis2.NewRepositoryRedis(clientRedis)
 	repositoryRedisTags := redis3.NewRepositoryRedis(clientRedis)
 	repositoryTags := db2.NewRepository(clientPostgresTasks)
 	repositoryTasks := postgres.NewRepository(clientPostgresTasks)
-
+	producerKafka := kafka2.NewRepository(clientKafka)
+	repositoryOutbox := outbox.NewOutboxRepository(clientPostgresTasks)
+	processor := worker.NewProcessor(repositoryOutbox, producerKafka, *logger)
 	newServiceTags := service2.NewService(repositoryTags, repositoryRedisTags)
-	newServiceTasks := service.NewService(repositoryTasks, repositoryTags, repositoryRedisTasks, usersClient)
+	newServiceTasks := service.NewService(repositoryTasks, repositoryTags, repositoryRedisTasks)
 
 	// Инициализация обработчиков
 	handlerTasks := handlers.NewHandler(newServiceTasks)
 	handlerTags := handlers2.NewHandler(newServiceTags)
-
 	router := httprouter.New()
 	handlerTags.Register(router)
 	handlerTasks.Register(router)
 
 	logger.Info("starting application")
+
+	go processor.Start(ctx)
 
 	// Запуск сервера с graceful shutdown
 	start(router, cfg, logger)

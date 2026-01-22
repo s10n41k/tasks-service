@@ -7,6 +7,7 @@ import (
 	"TODOLIST_Tasks/app/pkg/utils/translator"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	sq "github.com/Masterminds/squirrel"
@@ -20,18 +21,60 @@ type repositoryTasks struct {
 }
 
 func (r *repositoryTasks) CreateTask(ctx context.Context, task model2.Task) (string, error) {
+	// Начинаем транзакцию
+	tx, err := r.ClientPostgres1.Begin(ctx)
+	if err != nil {
+		return "", fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback(ctx)
 
-	// Сохраняем задачу
-	err := r.ClientPostgres1.QueryRow(ctx,
-		`INSERT INTO tasks(task_id, title, description, status, priory, due_date, user_id, tag_id)
-         VALUES($1, $2, $3, $4, $5, $6, $7, $8) RETURNING task_id`,
-		task.Id, task.Title, task.Description, translator.AntiTranslator(task.Status), task.Priory, task.DueDate, task.UserID, task.TagID,
-	).Scan(&task.Id)
+	// 1. Вставляем задачу в tasks с помощью squirrel
+	taskQuery, taskArgs, err := sq.
+		Insert("tasks").
+		Columns("task_id", "title", "description", "status", "priory", "due_date", "user_id", "tag_id").
+		Values(task.Id, task.Title, task.Description, translator.AntiTranslator(task.Status), task.Priory, task.DueDate, task.UserID, task.TagID).
+		Suffix("RETURNING task_id").
+		PlaceholderFormat(sq.Dollar).
+		ToSql()
 
-	if err != nil && !errors.Is(err, ctx.Err()) {
+	if err != nil {
+		return "", fmt.Errorf("failed to build task insert query: %w", err)
+	}
+
+	var taskID string
+	err = tx.QueryRow(ctx, taskQuery, taskArgs...).Scan(&taskID)
+	if err != nil {
 		return "", fmt.Errorf("ошибка при сохранении задачи: %w", err)
 	}
-	return task.Id, nil
+
+	// 2. Вставляем событие в outbox_events в той же транзакции
+	eventData, err := json.Marshal(task)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal task for outbox: %w", err)
+	}
+
+	outboxQuery, outboxArgs, err := sq.
+		Insert("outbox_events").
+		Columns("id", "aggregate_type", "aggregate_id", "event_type", "event_data", "created_at").
+		Values(uuid.New(), "task", taskID, "save", eventData, time.Now().UTC()).
+		PlaceholderFormat(sq.Dollar).
+		ToSql()
+
+	if err != nil {
+		return "", fmt.Errorf("failed to build outbox insert query: %w", err)
+	}
+
+	_, err = tx.Exec(ctx, outboxQuery, outboxArgs...)
+	if err != nil {
+		return "", fmt.Errorf("failed to insert outbox event: %w", err)
+	}
+
+	// Коммитим транзакцию
+	if err := tx.Commit(ctx); err != nil {
+		return "", fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	return taskID, nil
 }
 
 func (r *repositoryTasks) FindOneTask(ctx context.Context, id string) (model2.Task, error) {
@@ -173,36 +216,43 @@ func (r *repositoryTasks) UpdateTask(ctx context.Context, id string, task model2
 		return model2.Task{}, fmt.Errorf("недопустимый uuid: %s", id)
 	}
 
+	// Начинаем транзакцию
+	tx, err := r.ClientPostgres1.Begin(ctx)
+	if err != nil {
+		return model2.Task{}, fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
 	setClauses := []string{}
-	value := []interface{}{}
+	values := []interface{}{}
 	valueIndex := 1
 
 	if task.Title != nil {
-		value = append(value, *task.Title)
+		values = append(values, *task.Title)
 		setClauses = append(setClauses, fmt.Sprintf("title = $%d", valueIndex))
 		valueIndex++
 	}
 
 	if task.Description != nil {
-		value = append(value, *task.Description)
+		values = append(values, *task.Description)
 		setClauses = append(setClauses, fmt.Sprintf("description = $%d", valueIndex))
 		valueIndex++
 	}
 
 	if task.DueDate != nil {
-		value = append(value, *task.DueDate)
+		values = append(values, *task.DueDate)
 		setClauses = append(setClauses, fmt.Sprintf("due_date = $%d", valueIndex))
 		valueIndex++
 	}
 
 	if task.Priory != nil {
-		value = append(value, *task.Priory)
+		values = append(values, *task.Priory)
 		setClauses = append(setClauses, fmt.Sprintf("priory = $%d", valueIndex))
 		valueIndex++
 	}
 
 	if task.Status != nil {
-		value = append(value, *task.Status)
+		values = append(values, translator.AntiTranslator(*task.Status))
 		setClauses = append(setClauses, fmt.Sprintf("status = $%d", valueIndex))
 		valueIndex++
 	}
@@ -212,13 +262,11 @@ func (r *repositoryTasks) UpdateTask(ctx context.Context, id string, task model2
 		var tagId string
 
 		// Пытаемся найти тег по имени
-		err := r.ClientPostgres1.QueryRow(ctx,
-			`SELECT tag_id FROM tags WHERE name = $1`, *task.TagName).Scan(&tagId)
+		err := tx.QueryRow(ctx, `SELECT tag_id FROM tags WHERE name = $1`, *task.TagName).Scan(&tagId)
 
 		// Если тега нет — создаём
 		if err == sql.ErrNoRows {
-			err = r.ClientPostgres1.QueryRow(ctx,
-				`INSERT INTO tags (name) VALUES ($1) RETURNING tag_id`, *task.TagName).Scan(&tagId)
+			err = tx.QueryRow(ctx, `INSERT INTO tags (name) VALUES ($1) RETURNING tag_id`, *task.TagName).Scan(&tagId)
 			if err != nil {
 				return model2.Task{}, fmt.Errorf("не удалось создать тег: %w", err)
 			}
@@ -226,7 +274,7 @@ func (r *repositoryTasks) UpdateTask(ctx context.Context, id string, task model2
 			return model2.Task{}, fmt.Errorf("ошибка при получении тега: %w", err)
 		}
 
-		value = append(value, tagId)
+		values = append(values, tagId)
 		setClauses = append(setClauses, fmt.Sprintf("tag_id = $%d", valueIndex))
 		valueIndex++
 	}
@@ -235,29 +283,132 @@ func (r *repositoryTasks) UpdateTask(ctx context.Context, id string, task model2
 		return model2.Task{}, fmt.Errorf("нет полей для обновления")
 	}
 
+	// 1. Обновляем задачу
 	query := fmt.Sprintf("UPDATE tasks SET %s WHERE task_id = $%d", strings.Join(setClauses, ", "), valueIndex)
-	value = append(value, id)
+	values = append(values, id)
 
-	_, err := r.ClientPostgres1.Exec(ctx, query, value...)
+	result, err := tx.Exec(ctx, query, values...)
 	if err != nil {
 		return model2.Task{}, fmt.Errorf("не удалось обновить задачу: %w", err)
 	}
-	oneTask, err := r.FindOneTask(ctx, id)
-	if err != nil {
-		return model2.Task{}, err
+
+	if result.RowsAffected() == 0 {
+		return model2.Task{}, fmt.Errorf("задача с ID %s не найдена", id)
 	}
-	return oneTask, nil
+
+	// 2. Получаем обновленную задачу
+	var updatedTask model2.Task
+	var status string
+	err = tx.QueryRow(ctx, `
+		SELECT task_id, title, description, status, priory, due_date, user_id, tag_id, created_at 
+		FROM tasks WHERE task_id = $1
+	`, id).Scan(
+		&updatedTask.Id, &updatedTask.Title, &updatedTask.Description, &status,
+		&updatedTask.Priory, &updatedTask.DueDate, &updatedTask.UserID, &updatedTask.TagID, &updatedTask.CreatedAt,
+	)
+	if err != nil {
+		return model2.Task{}, fmt.Errorf("ошибка при получении обновленной задачи: %w", err)
+	}
+	updatedTask.Status = translator.Translator(status)
+
+	// 3. Вставляем событие в outbox
+	eventData, err := json.Marshal(updatedTask)
+	if err != nil {
+		return model2.Task{}, fmt.Errorf("failed to marshal task for outbox: %w", err)
+	}
+
+	outboxQuery, outboxArgs, err := sq.
+		Insert("outbox_events").
+		Columns("id", "aggregate_type", "aggregate_id", "event_type", "event_data", "created_at").
+		Values(uuid.New().String(), "task", id, "update", eventData, time.Now().UTC()).
+		PlaceholderFormat(sq.Dollar).
+		ToSql()
+
+	if err != nil {
+		return model2.Task{}, fmt.Errorf("failed to build outbox insert query: %w", err)
+	}
+
+	_, err = tx.Exec(ctx, outboxQuery, outboxArgs...)
+	if err != nil {
+		return model2.Task{}, fmt.Errorf("failed to insert outbox event: %w", err)
+	}
+
+	// Коммитим транзакцию
+	if err := tx.Commit(ctx); err != nil {
+		return model2.Task{}, fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	return updatedTask, nil
 }
 
 func (r *repositoryTasks) DeleteTask(ctx context.Context, id string) (string, error) {
 	if _, err := uuid.Parse(id); err != nil {
 		return "", fmt.Errorf("Invalid uuid:%s", id)
 	}
-	query := `DELETE FROM tasks WHERE task_id = $1`
-	_, err := r.ClientPostgres1.Exec(ctx, query, id)
+
+	// Начинаем транзакцию
+	tx, err := r.ClientPostgres1.Begin(ctx)
 	if err != nil {
-		return "", fmt.Errorf("failed to delete tags: %w", err)
+		return "", fmt.Errorf("failed to begin transaction: %w", err)
 	}
+	defer tx.Rollback(ctx)
+
+	// 1. Сначала получаем задачу для outbox
+	var task model2.Task
+	var status string
+	err = tx.QueryRow(ctx, `
+		SELECT task_id, title, description, status, priory, due_date, user_id, tag_id, created_at 
+		FROM tasks WHERE task_id = $1
+	`, id).Scan(
+		&task.Id, &task.Title, &task.Description, &status,
+		&task.Priory, &task.DueDate, &task.UserID, &task.TagID, &task.CreatedAt,
+	)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return "", fmt.Errorf("задача с ID %s не найдена", id)
+		}
+		return "", fmt.Errorf("ошибка при поиске задачи: %w", err)
+	}
+	task.Status = translator.Translator(status)
+
+	// 2. Удаляем задачу
+	query := `DELETE FROM tasks WHERE task_id = $1`
+	result, err := tx.Exec(ctx, query, id)
+	if err != nil {
+		return "", fmt.Errorf("failed to delete task: %w", err)
+	}
+
+	if result.RowsAffected() == 0 {
+		return "", fmt.Errorf("задача с ID %s не найдена", id)
+	}
+
+	// 3. Вставляем событие в outbox
+	eventData, err := json.Marshal(task)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal task for outbox: %w", err)
+	}
+
+	outboxQuery, outboxArgs, err := sq.
+		Insert("outbox_events").
+		Columns("id", "aggregate_type", "aggregate_id", "event_type", "event_data", "created_at").
+		Values(uuid.New().String(), "task", id, "delete", eventData, time.Now().UTC()).
+		PlaceholderFormat(sq.Dollar).
+		ToSql()
+
+	if err != nil {
+		return "", fmt.Errorf("failed to build outbox insert query: %w", err)
+	}
+
+	_, err = tx.Exec(ctx, outboxQuery, outboxArgs...)
+	if err != nil {
+		return "", fmt.Errorf("failed to insert outbox event: %w", err)
+	}
+
+	// Коммитим транзакцию
+	if err := tx.Commit(ctx); err != nil {
+		return "", fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
 	return "delete ok", nil
 }
 

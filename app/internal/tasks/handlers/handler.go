@@ -84,8 +84,8 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) error {
 	}
 
 	ctx, cancel := context.WithTimeout(r.Context(), 4*time.Second)
-	defer cancel()
 
+	defer cancel()
 	taskResult, err := h.service.CreateTask(ctx, task)
 	if err != nil {
 		http.Error(w, "Failed to save task", http.StatusInternalServerError)

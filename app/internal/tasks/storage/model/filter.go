@@ -6,6 +6,7 @@ import (
 	"TODOLIST_Tasks/app/pkg/utils/operator"
 	"fmt"
 	"strings"
+	"time"
 )
 
 type StorageOptions struct {
@@ -31,55 +32,106 @@ func NewFilterOptions(option filter.Option) postgres.FilterOptions {
 		}
 	}
 
-	return storageOptions
+	return &storageOptions
 }
 
-func (o StorageOptions) CreateQuery() string {
+func (o *StorageOptions) CreateQuery() string {
 	var queryParts []string
 
 	for _, field := range o.Fields {
-		op, err := operator.GetSQLOperator(field.Operator)
+		sqlCondition, err := o.createSQLCondition(field)
 		if err != nil {
-			return fmt.Sprintf("%v", err)
+			return fmt.Sprintf("Error: %v", err)
 		}
-
-		field.Operator = op
-		field.Value = parseAndConvert(field.Value)
-
-		if field.Operator == "ILIKE" {
-			// Генерируем условия для ILIKE
-			ilikeConditions := []string{
-				fmt.Sprintf("%s ILIKE %v", field.Name, field.Value),                 // Полное совпадение
-				fmt.Sprintf("%s ILIKE '%%' || %v || '%%'", field.Name, field.Value), // Содержит
-			}
-			// Добавляем все ILIKE условия к queryParts, оборачивая в скобки
-			queryParts = append(queryParts, fmt.Sprintf("(%s)", strings.Join(ilikeConditions, " OR ")))
-		} else {
-			// Для остальных операторов
-			queryParts = append(queryParts, fmt.Sprintf("%s %s %v", field.Name, field.Operator, field.Value))
-		}
+		queryParts = append(queryParts, sqlCondition)
 	}
 
-	// Формируем итоговое условие с использованием AND
 	return strings.Join(queryParts, " AND ")
 }
-func parseAndConvert(input string) string {
-	parts := strings.Split(input, ":")
 
-	if len(parts) == 1 { // Одна дата
-		if strings.Count(parts[0], "-") == 4 { // Формат "ГГГГ-ММ-ДД-ЧЧ-ММ"
-			date := parts[0]
-			return "'" + date[:10] + " " + strings.Replace(date[11:], "-", ":", 1) + "'" // Формат: "'ГГГГ-ММ-ДД ЧЧ:ММ'"
-		} else if strings.Count(parts[0], "-") == 3 { // Формат "ГГГГ-ММ-ДД"
-			return "'" + parts[0] + "'" // Возвращаем как есть с кавычками
-		}
-	} else if len(parts) == 2 { // Две даты
-		startDate := parts[0]
-		endDate := parts[1]
-
-		startDateTime := "'" + startDate[:10] + " " + strings.Replace(startDate[11:], "-", ":", 1) + "'" // "'ГГГГ-ММ-ДД ЧЧ:ММ'"
-		endDateTime := "'" + endDate[:10] + " " + strings.Replace(endDate[11:], "-", ":", 1) + "'"       // "'ГГГГ-ММ-ДД ЧЧ:ММ'"
-		return fmt.Sprintf("%s AND %s", startDateTime, endDateTime)
+func (o *StorageOptions) createSQLCondition(field StorageField) (string, error) {
+	sqlOperator, err := operator.GetSQLOperator(field.Operator)
+	if err != nil {
+		return "", err
 	}
-	return fmt.Sprintf("'%s'", input) // Возвращаем как есть, если формат не соответствует
+
+	// Обрабатываем специальные операторы
+	switch sqlOperator {
+	case "ILIKE":
+		return o.createILIKECondition(field.Name, field.Value), nil
+	case "BETWEEN":
+		return o.createBETWEENCondition(field.Name, field.Value), nil
+	default:
+		formattedValue := o.formatValue(field.Value, sqlOperator)
+		return fmt.Sprintf("%s %s %s", field.Name, sqlOperator, formattedValue), nil
+	}
+}
+
+func (o *StorageOptions) createILIKECondition(fieldName, value string) string {
+	// Для ILIKE создаем несколько вариантов поиска
+	conditions := []string{
+		fmt.Sprintf("%s ILIKE '%s'", fieldName, value),     // Точное совпадение
+		fmt.Sprintf("%s ILIKE '%%%s'", fieldName, value),   // Заканчивается на
+		fmt.Sprintf("%s ILIKE '%s%%'", fieldName, value),   // Начинается с
+		fmt.Sprintf("%s ILIKE '%%%s%%'", fieldName, value), // Содержит
+	}
+	return fmt.Sprintf("(%s)", strings.Join(conditions, " OR "))
+}
+
+func (o *StorageOptions) createBETWEENCondition(fieldName, value string) string {
+	// Ожидаем формат "start:end" для BETWEEN
+	parts := strings.Split(value, ":")
+	if len(parts) == 2 {
+		start := o.formatSimpleValue(parts[0])
+		end := o.formatSimpleValue(parts[1])
+		return fmt.Sprintf("%s BETWEEN %s AND %s", fieldName, start, end)
+	}
+	// Fallback - если формат неправильный
+	return fmt.Sprintf("%s = %s", fieldName, o.formatSimpleValue(value))
+}
+
+func (o *StorageOptions) formatValue(value, operator string) string {
+	// Для числовых операторов не добавляем кавычки
+	if o.isNumericOperator(operator) {
+		return value
+	}
+	// Для строковых операторов добавляем кавычки
+	return o.formatSimpleValue(value)
+}
+
+func (o *StorageOptions) isNumericOperator(operator string) bool {
+	numericOperators := []string{"=", ">", "<", ">=", "<=", "!="}
+	for _, op := range numericOperators {
+		if operator == op {
+			return true
+		}
+	}
+	return false
+}
+
+func (o *StorageOptions) formatSimpleValue(value string) string {
+	// Пытаемся распарсить как дату
+	if formatted, ok := o.tryParseDate(value); ok {
+		return formatted
+	}
+	// Для обычных строк - добавляем кавычки
+	return fmt.Sprintf("'%s'", value)
+}
+
+func (o *StorageOptions) tryParseDate(value string) (string, bool) {
+	// Пробуем разные форматы дат
+	formats := []string{
+		"2006-01-02-15-04", // ГГГГ-ММ-ДД-ЧЧ-ММ
+		"2006-01-02",       // ГГГГ-ММ-ДД
+		time.RFC3339,       // Стандартный формат
+	}
+
+	for _, format := range formats {
+		if parsed, err := time.Parse(format, value); err == nil {
+			// Возвращаем в SQL формате
+			return fmt.Sprintf("'%s'", parsed.Format("2006-01-02 15:04:05")), true
+		}
+	}
+
+	return "", false
 }

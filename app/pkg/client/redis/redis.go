@@ -34,11 +34,10 @@ func NewClient(ctx context.Context, maxAttempts int, sc config.StorageRedisTasks
 		// Создаем новый Redis клиент
 		client = redis.NewClient(&redis.Options{
 			Addr:     fmt.Sprintf("%s:%s", sc.Host, sc.Port),
-			Password: sc.Password, // если используется пароль
-			DB:       0,           // используем базу данных 0
+			Password: sc.Password,
+			DB:       0,
 		})
 
-		// Пингуем Redis, чтобы убедиться, что соединение установлено
 		_, err := client.Ping(ctx).Result()
 		if err != nil {
 			return err
