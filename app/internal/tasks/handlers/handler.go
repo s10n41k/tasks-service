@@ -4,6 +4,7 @@ import (
 	"TODOLIST_Tasks/app/internal/apperror"
 	model2 "TODOLIST_Tasks/app/internal/tasks/model"
 	"TODOLIST_Tasks/app/internal/tasks/service"
+	signature "TODOLIST_Tasks/app/pkg/api/ signature"
 	"TODOLIST_Tasks/app/pkg/api/filter"
 	"TODOLIST_Tasks/app/pkg/api/resilience"
 	sort2 "TODOLIST_Tasks/app/pkg/api/sort"
@@ -41,12 +42,12 @@ func NewHandler(service *service.Service) *Handler {
 }
 
 func (h *Handler) Register(router *httprouter.Router) {
-	router.HandlerFunc(http.MethodPost, tasksByUserURL, apperror.Middleware(h.Create))
-	router.HandlerFunc(http.MethodPatch, taskURL, apperror.Middleware(h.Update))
-	router.HandlerFunc(http.MethodGet, taskURL, resilience.Middleware(apperror.Middleware(h.FindOne)))
-	router.HandlerFunc(http.MethodGet, tasksByUserURL, resilience.Middleware(filter.Middleware(sort2.MiddleWare(apperror.Middleware(h.GetList), "due_date", sort2.ASC))))
-	router.HandlerFunc(http.MethodDelete, taskURL, apperror.Middleware(h.Delete))
-	router.HandlerFunc(http.MethodGet, tasksByTags, resilience.Middleware(filter.Middleware(sort2.MiddleWare(apperror.Middleware(h.GetListByTag), "due_date", sort2.ASC))))
+	router.HandlerFunc(http.MethodPost, tasksByUserURL, signature.Middleware(apperror.Middleware(h.Create)))
+	router.HandlerFunc(http.MethodPatch, taskURL, signature.Middleware(apperror.Middleware(h.Update)))
+	router.HandlerFunc(http.MethodGet, taskURL, signature.Middleware(resilience.Middleware(apperror.Middleware(h.FindOne))))
+	router.HandlerFunc(http.MethodGet, tasksByUserURL, signature.Middleware(resilience.Middleware(filter.Middleware(sort2.MiddleWare(apperror.Middleware(h.GetList), "due_date", sort2.ASC)))))
+	router.HandlerFunc(http.MethodDelete, taskURL, signature.Middleware(apperror.Middleware(h.Delete)))
+	router.HandlerFunc(http.MethodGet, tasksByTags, signature.Middleware(resilience.Middleware(filter.Middleware(sort2.MiddleWare(apperror.Middleware(h.GetListByTag), "due_date", sort2.ASC)))))
 }
 func (h *Handler) Create(w http.ResponseWriter, r *http.Request) error {
 	h.logger.Info("CreateTask called")
