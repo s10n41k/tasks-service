@@ -6,7 +6,7 @@ import (
 )
 
 type Repository interface {
-	CreateTask(ctx context.Context, task model2.Task) (string, error)
+	CreateTask(ctx context.Context, task model2.Task) error
 	UpdateTask(ctx context.Context, id string, task model2.TaskUpdateDTO) (model2.Task, error)
 	DeleteTask(ctx context.Context, id string) (string, error)
 	FindOneTask(ctx context.Context, id string) (model2.Task, error)

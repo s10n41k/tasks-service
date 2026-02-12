@@ -14,7 +14,7 @@ type TaskCreateDTO struct {
 	Completed   string    `json:"completed"`
 	DueDate     time.Time `json:"due_date"`
 	UserId      string    `json:"user_id"`
-	TagID       string    `json:"tag_id"`
+	TagID       *string   `json:"tag_id,omitempty"`
 	TagName     string    `json:"tag_name"`
 }
 

@@ -14,7 +14,7 @@ import (
 
 func Middleware(h http.HandlerFunc) http.HandlerFunc {
 	// Берем секрет из переменной окружения
-	secret := os.Getenv("GATEWAY_SECRET")
+	secret := os.Getenv("GATEWAY_SIGN")
 	if secret == "" {
 		secret = os.Getenv("SIGN_SECRET")
 	}

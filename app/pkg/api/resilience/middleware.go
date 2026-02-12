@@ -16,15 +16,15 @@ const baseDelay = 50 * time.Millisecond
 func Middleware(handlerFunc http.HandlerFunc) http.HandlerFunc {
 	cbSettings := gobreaker.Settings{
 		Name:        "global-circuit-breaker",
-		MaxRequests: 5,
-		Timeout:     5 * time.Second,
+		MaxRequests: 10,
+		Timeout:     10 * time.Second,
 		ReadyToTrip: func(c gobreaker.Counts) bool {
 			failRatio := float64(c.TotalFailures) / float64(c.Requests)
 			return c.Requests >= 5 && failRatio >= 0.5
 		},
 	}
 	cb := gobreaker.NewCircuitBreaker(cbSettings)
-	limiter := rate.NewLimiter(rate.Limit(10), 10)
+	limiter := rate.NewLimiter(rate.Limit(1000), 1000)
 
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !limiter.Allow() {

@@ -1,76 +1,74 @@
 package config
 
 import (
-	"TODOLIST_Tasks/app/pkg/logging"
-	"flag"
-	"github.com/ilyakaznacheev/cleanenv"
-	"log/slog"
 	"os"
-	"sync"
+	"strings"
 )
 
 type Config struct {
-	ListenConfig          ListenConfig         `yaml:"listen"`
-	StoragePostgresConfig StoragePostgresTasks `yaml:"storagePostgresTasks"`
-	StorageRedisConfig    StorageRedisTasks    `yaml:"storageRedisTasks"`
-	KafkaConfig           KafkaConfig          `yaml:"kafkaTasks"`
+	Listen struct {
+		Type   string
+		Port   string
+		BindIP string
+	}
+	Postgres struct {
+		Host     string
+		Port     string
+		Database string
+		Username string
+		Password string
+	}
+	Redis struct {
+		Host     string
+		Port     string
+		Password string
+		Protocol string
+	}
+	Kafka struct {
+		Brokers []string
+		GroupID string
+	}
+	JWTSecret     string
+	GatewaySecret string
+	GatewaySign   string
 }
 
-type ListenConfig struct {
-	Type   string `yaml:"type" env-default:"port"`
-	Port   string `yaml:"port" env-default:"8000"`
-	BindIP string `yaml:"bind_ip" env-default:"127.0.0.1"`
+func GetConfig() (*Config, error) {
+	cfg := &Config{}
+
+	// Listen
+	cfg.Listen.Port = getEnv("TASKS_PORT", "8000")
+	cfg.Listen.BindIP = getEnv("LISTEN_BIND_IP", "0.0.0.0")
+	cfg.Listen.Type = "port"
+
+	// PostgreSQL
+	cfg.Postgres.Host = getEnv("DB_TASKS_HOST", "postgres-tasks")
+	cfg.Postgres.Port = getEnv("DB_TASKS_PORT", "5433")
+	cfg.Postgres.Database = getEnv("DB_TASKS_DATABASE", "mydatabase1")
+	cfg.Postgres.Username = getEnv("DB_TASKS_USERNAME", "user1")
+	cfg.Postgres.Password = getEnv("DB_TASKS_PASSWORD", "password1")
+
+	// Redis
+	cfg.Redis.Host = getEnv("REDIS_TASKS_HOST", "redis-tasks")
+	cfg.Redis.Port = getEnv("REDIS_TASKS_PORT", "6379")
+	cfg.Redis.Password = getEnv("REDIS_TASKS_PASSWORD", "")
+	cfg.Redis.Protocol = "tcp"
+
+	// Kafka
+	brokers := getEnv("KAFKA_BROKER", "kafka:9092")
+	cfg.Kafka.Brokers = strings.Split(brokers, ",")
+	cfg.Kafka.GroupID = getEnv("KAFKA_GROUP_TASKS", "tasks-service-group")
+
+	// Secrets
+	cfg.JWTSecret = getEnv("JWT_SECRET", "uYk3Pq7RvA1wXzJ5LmN9tBcDfGhJkMnP2S4V6Y8ZaCd")
+	cfg.GatewaySecret = getEnv("GATEWAY_SIGN", "68b329da9893e34099c7d8ad5cb9c940")
+
+	return cfg, nil
 }
 
-type StoragePostgresTasks struct {
-	Host     string `yaml:"host" env-default:"localhost"`
-	Port     string `yaml:"port" env-default:"4000"`
-	Database string `yaml:"database" env-default:"mydatabase1"`
-	Username string `yaml:"username" env-default:"user1"`
-	Password string `yaml:"password" env-default:"password1"`
-}
-
-type StorageRedisTasks struct {
-	Host     string `yaml:"host" env-default:"localhost"`
-	Port     string `yaml:"port" env-default:"6379"`
-	Username string
-	Password string `yaml:"password" env-default:"yourpassword"`
-	Protocol string `yaml:"protocol" env-default:"tcp"`
-}
-type KafkaConfig struct {
-	Brokers []string `yaml:"brokers" env-default:"localhost:4500"`
-	GroupID string   `yaml:"group_id" env-default:"tasks-service-group"`
-}
-
-const (
-	flagConfigPathName = "config"
-	envConfigPathName  = "CONFIG_PATH"
-)
-
-var instance *Config
-var once sync.Once
-
-func GetConfig() *Config {
-	once.Do(func() {
-		logger := logging.GetLogger()
-		var configPath string
-		flag.StringVar(&configPath, flagConfigPathName, "", "path to config file")
-		flag.Parse()
-
-		if path, ok := os.LookupEnv(envConfigPathName); ok {
-			configPath = path
-		}
-		instance = &Config{}
-
-		if readErr := cleanenv.ReadConfig(configPath, instance); readErr != nil {
-			description, descErr := cleanenv.GetDescription(instance, nil)
-			if descErr != nil {
-				panic(descErr)
-			}
-			logger.Info(description)
-			logger.Error("failed to read config ", slog.String("err", readErr.Error()), slog.String("path", configPath))
-			os.Exit(1)
-		}
-	})
-	return instance
+func getEnv(key, defaultValue string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return defaultValue
 }
