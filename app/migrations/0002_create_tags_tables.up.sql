@@ -9,3 +9,4 @@ CREATE TABLE custom_tag (
     user_id UUID NOT NULL,
     UNIQUE (name, user_id)
 );
+

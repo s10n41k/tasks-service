@@ -10,9 +10,8 @@ import (
 	"TODOLIST_Tasks/app/pkg/api/sort"
 	logging2 "TODOLIST_Tasks/app/pkg/logging"
 	"context"
-	"database/sql"
-	"errors"
 	"fmt"
+	"time"
 )
 
 type Service struct {
@@ -42,14 +41,6 @@ func (s *Service) DeleteTaskRedis(ctx context.Context, id string) error {
 	return nil
 }
 
-func (s *Service) CreateTaskRedis(ctx context.Context, task model.Task) error {
-	err := s.RepositoryRedis.CacheTask(ctx, task)
-	if err != nil {
-		return err
-	}
-	return nil
-}
-
 func (s *Service) UpdateTaskRedis(ctx context.Context, task model.Task) error {
 
 	err := s.RepositoryRedis.CacheTask(ctx, task)
@@ -59,32 +50,28 @@ func (s *Service) UpdateTaskRedis(ctx context.Context, task model.Task) error {
 	return nil
 }
 
-func (s *Service) CreateTask(ctx context.Context, task model.Task) (model.Task, error) {
-	// Проверка тега
-	if task.TagID != "" {
-		tag, err := s.RepositoryTags.FindOneTags(ctx, task.TagID, task.UserID)
-		if err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				return model.Task{}, fmt.Errorf("тег с ID %s не найден", task.TagID)
-			}
-			return model.Task{}, fmt.Errorf("ошибка при поиске тега: %w", err)
-		}
-		task.TagsName = tag.Name
-	}
-
-	// Создание в Postgres (теперь в репозитории автоматически сохраняется в outbox)
-	taskID, err := s.RepositoryTasks.CreateTask(ctx, task)
+// CreateTask - обратная совместимость
+func (s *Service) CreateTask(ctx context.Context, task model.Task) error {
+	err := s.RepositoryTasks.CreateTask(ctx, task)
 	if err != nil {
-		return model.Task{}, fmt.Errorf("ошибка создания задачи: %w", err)
+		return err
 	}
+	return nil
+}
 
-	taskResult, err := s.RepositoryTasks.FindOneTask(ctx, taskID)
+func (s *Service) CreateTaskRedis(ctx context.Context, task model.Task) error {
+	s.Logger.Info("🔴 Service.CreateTaskRedis START")
+	start := time.Now()
+
+	err := s.RepositoryRedis.CacheTask(ctx, task)
+
 	if err != nil {
-		return model.Task{}, fmt.Errorf("ошибка поиска задачи: %w", err)
+		s.Logger.Errorf("❌ Redis cache error: %v", err)
+	} else {
+		s.Logger.Infof("✅ Redis cache took: %v", time.Since(start))
 	}
 
-	s.Logger.Infof("Task %s created successfully", taskResult.Id)
-	return taskResult, nil
+	return err
 }
 
 func (s *Service) UpdateTask(ctx context.Context, id string, task model.TaskUpdateDTO) (model.Task, error) {

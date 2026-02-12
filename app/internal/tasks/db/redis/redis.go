@@ -8,7 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	redis3 "github.com/go-redis/redis/v8"
+	redis3 "github.com/go-redis/redis/v8" // 🔥 ИМПОРТИРУЕМ КАК redis3
 	"time"
 )
 
@@ -22,21 +22,37 @@ func (r *repositoryRedis) CacheTask(ctx context.Context, task model2.Task) error
 		return err
 	}
 
-	// Ключ для хранения самой задачи
+	// 🔥 ПРЯМОЙ TYPE ASSERTION К *redis3.Client
+	if rawClient, ok := r.Client.(*redis3.Client); ok {
+		// 🔥 ИСПОЛЬЗУЕМ TxPipeline() - работает с *redis.Client
+		pipe := rawClient.TxPipeline()
+
+		key := fmt.Sprintf("task:%s", task.Id)
+		userKey := fmt.Sprintf("user_tasks:%s", task.UserID)
+		tagKey := fmt.Sprintf("tag_tasks:%s", task.TagID)
+
+		// Все 3 команды в пайплайн
+		pipe.Set(ctx, key, data, 24*time.Hour)
+		pipe.SAdd(ctx, userKey, task.Id)
+		pipe.SAdd(ctx, tagKey, task.Id)
+
+		// 🔥 ОДИН сетевой вызов вместо трех
+		_, err = pipe.Exec(ctx)
+		return err
+	}
+
+	// 🔥 Fallback: если не сработал type assertion
 	key := fmt.Sprintf("task:%s", task.Id)
+	userKey := fmt.Sprintf("user_tasks:%s", task.UserID)
+	tagKey := fmt.Sprintf("tag_tasks:%s", task.TagID)
+
 	err = r.Client.Set(ctx, key, data, 24*time.Hour).Err()
 	if err != nil {
 		return err
 	}
 
-	// Ключи для множества задач по userID и tagID
-	userKey := fmt.Sprintf("user_tasks:%s", task.UserID)
-	tagKey := fmt.Sprintf("tag_tasks:%s", task.TagID)
-
-	// Добавляем идентификатор задачи в множества
 	r.Client.SAdd(ctx, userKey, task.Id)
 	r.Client.SAdd(ctx, tagKey, task.Id)
-
 	return nil
 }
 

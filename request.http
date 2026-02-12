@@ -2,7 +2,33 @@
 DELETE  http://localhost:8000/tasks/871821e7-09f9-43a8-a9aa-23bd7bf05935
 Accept: application/json
 
+###
 
+POST http://localhost:3000/auth/register
+Content-Type: application/json
+
+{
+  "email": "sebrov2019@mail.ru",
+  "password": "48Region@",
+  "name": "Арсений"
+}
+###
+POST http://localhost:3000/auth/verify-email
+Content-Type: application/json
+
+{
+  "session": "user:sebrov2019@mail.ru",
+  "code": ""
+}
+###
+POST http://localhost:3000/auth/login
+Content-Type: application/json
+
+{
+  "email": "sebrov2019@mail.ru",
+  "password": "48Region@",
+  "deviceID": "123"
+}
 ###
 //field=eq/gt/lt/gte/lte:30
 
@@ -25,8 +51,9 @@ Content-Type: application/json
 
 ###
 
-POST http://localhost:8000/v1/users/ff0305bf-f2cf-4c3f-bbed-aed123393135/tasks
+POST http://localhost:3000/v1/users/5af30425-d75b-4e0d-b6da-0f30aa2b7918/tasks
 Content-Type: application/json
+Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJleHAiOjE3NzAxMTQ1MTAsImlhdCI6MTc3MDExMzYxMCwianRpIjoiNGMwM2M3OTMtODBlYi00ODgwLWI4M2MtMTAxYzY5Yzc5MmJkIiwicm9sZXMiOiJ1c2VyIiwic2Vzc2lvbiI6IjVhZjMwNDI1LWQ3NWItNGUwZC1iNmRhLTBmMzBhYTJiNzkxODoxMjMiLCJzdWIiOiI1YWYzMDQyNS1kNzViLTRlMGQtYjZkYS0wZjMwYWEyYjc5MTgiLCJ2ZXIiOjF9.hDTLt18q9F5lrT5MIt8O2USABaQb6lJGRoM_4r1NC7M
 
 {
   "title": "ТЕСТ",
@@ -34,10 +61,10 @@ Content-Type: application/json
   "status": "in_progress",
   "priory": "blue",
   "due_date": "2025-05-02 15:59",
-  "tag_id": "1d1417c3-6792-42c1-94cd-77ef98c063d7"
+  "tag_id": "c3d4e5f6-a7b8-4c9d-0e1f-2a3b4c5d6e7f"
 }
 
-###
+###"tag_id": "1d1417c3-6792-42c1-94cd-77ef98c063d7"
 
 PATCH http://localhost:8000/tasks/db238fd2-3ee0-43be-a592-98a07459a54f
 Accept: application/json

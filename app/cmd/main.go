@@ -23,23 +23,27 @@ import (
 	"github.com/julienschmidt/httprouter"
 	"net"
 	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"os/signal"
-	"path"
-	"path/filepath"
+	"runtime"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
 
 func main() {
 	logger := logging.GetLogger()
-	cfg := config.GetConfig()
+	cfg, err := config.GetConfig()
+	if err != nil {
+		logger.Fatal(err)
+	}
 
 	// Инициализация клиентов БД с контекстом
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	clientPostgresTasks, err := postgresql.NewClient(ctx, 10, cfg.StoragePostgresConfig)
+	clientPostgresTasks, err := postgresql.NewClient(ctx, 10, *cfg)
 	if err != nil {
 		logger.Fatal(err)
 	}
@@ -48,7 +52,7 @@ func main() {
 		logger.Info("Postgres is closed")
 	}()
 
-	clientRedis, err := redis.NewClient(ctx, 10, cfg.StorageRedisConfig)
+	clientRedis, err := redis.NewClient(ctx, 10, *cfg)
 	if err != nil {
 		logger.Fatal(err)
 	}
@@ -59,7 +63,7 @@ func main() {
 		}
 	}()
 
-	clientKafka, err := kafka.NewClient(cfg.KafkaConfig)
+	clientKafka, err := kafka.NewClient(*cfg)
 	if err != nil {
 		logger.Fatal(err)
 	}
@@ -74,7 +78,7 @@ func main() {
 	repositoryRedisTasks := redis2.NewRepositoryRedis(clientRedis)
 	repositoryRedisTags := redis3.NewRepositoryRedis(clientRedis)
 	repositoryTags := db2.NewRepository(clientPostgresTasks)
-	repositoryTasks := postgres.NewRepository(clientPostgresTasks)
+	repositoryTasks := postgres.NewRepository(clientPostgresTasks, *logger)
 	producerKafka := kafka2.NewRepository(clientKafka)
 	repositoryOutbox := outbox.NewOutboxRepository(clientPostgresTasks)
 	processor := worker.NewProcessor(repositoryOutbox, producerKafka, *logger)
@@ -100,66 +104,74 @@ func start(
 	router *httprouter.Router,
 	cfg *config.Config,
 	logger *logging.Logger,
-
 ) {
-	var listener net.Listener
-	var listenErr error
+	listenAddr := fmt.Sprintf("%s:%s", cfg.Listen.BindIP, cfg.Listen.Port)
+	logger.Infof("🚀 STARTING HIGH LOAD SERVER ON %s", listenAddr)
 
-	if cfg.ListenConfig.Type == "sock" {
-		logger.Info("detect app path")
-		appDir, err := filepath.Abs(filepath.Dir(os.Args[0]))
-		if err != nil {
-			logger.Fatal(err)
-		}
-		socketPath := path.Join(appDir, "app.sock")
-		logger.Infof("listen unix socket: %s", socketPath)
-		listener, listenErr = net.Listen("unix", socketPath)
-	} else {
-		listenAddr := fmt.Sprintf("%s:%s", cfg.ListenConfig.BindIP, cfg.ListenConfig.Port)
-		logger.Infof("listen tcp on %s", listenAddr)
-		listener, listenErr = net.Listen("tcp", listenAddr)
+	// TCP listener
+	listener, err := net.Listen("tcp", listenAddr)
+	if err != nil {
+		logger.Fatal(err)
 	}
 
-	if listenErr != nil {
-		logger.Fatal(listenErr)
-	}
-
+	// HTTP сервер с минимальными таймаутами
 	server := &http.Server{
-		Handler:      router,
-		WriteTimeout: 15 * time.Second,
-		ReadTimeout:  15 * time.Second,
+		Handler:           router,
+		ReadTimeout:       15 * time.Second,
+		ReadHeaderTimeout: 10 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		IdleTimeout:       30 * time.Second,
+		MaxHeaderBytes:    0, // без лимита
 	}
 
-	// Канал для получения ошибок от сервера
-	serverErr := make(chan error, 1)
-	go func() {
-		logger.Info("server is starting...")
-		if err := server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			serverErr <- err
+	// Лимитер одновременных горутин (10k)
+	limiter := make(chan struct{}, 500)
+	server.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case limiter <- struct{}{}:
+			defer func() { <-limiter }()
+			router.ServeHTTP(w, r)
+		default:
+			// быстрый отказ при перегрузке
+			w.WriteHeader(http.StatusTooManyRequests)
+			w.Write([]byte("429 Too Many Requests"))
 		}
-		close(serverErr)
-	}()
+	})
 
-	// Канал для сигналов ОС
+	logger.Info("🔥 SERVER STARTED - READY FOR HIGH LOAD")
+	if err := server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		logger.Fatal(err)
+	}
+	waitForShutdown(server, logger)
+}
+
+// 🔥 7. ДОБАВЬ ГЛОБАЛЬНЫЙ СЧЁТЧИК
+var requestCounter int64
+
+func countMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt64(&requestCounter, 1)
+		next.ServeHTTP(w, r)
+	})
+}
+
+// 🔥 8. УТИЛИТА ДЛЯ ПАМЯТИ
+func getMemoryMB() uint64 {
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	return m.Alloc / 1024 / 1024
+}
+
+// 🔥 9. УПРОЩЁННЫЙ SHUTDOWN
+func waitForShutdown(server *http.Server, logger *logging.Logger) {
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
-	// Ожидаем либо сигнал завершения, либо ошибку сервера
-	select {
-	case err := <-serverErr:
-		logger.Fatalf("server error: %v", err)
-	case sig := <-sigChan:
-		logger.Infof("received signal: %v, initiating shutdown...", sig)
+	<-sigChan
+	logger.Info("Shutting down...")
 
-		// Таймаут для graceful shutdown
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 
-		// Остановка сервера
-		if err := server.Shutdown(ctx); err != nil {
-			logger.Errorf("server shutdown error: %v", err)
-		}
-
-		logger.Info("server stopped gracefully")
-	}
+	server.Shutdown(ctx)
 }

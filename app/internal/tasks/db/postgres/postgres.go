@@ -4,6 +4,7 @@ import (
 	model2 "TODOLIST_Tasks/app/internal/tasks/model"
 	"TODOLIST_Tasks/app/internal/tasks/storage/postgres"
 	postgresql "TODOLIST_Tasks/app/pkg/client/postgres"
+	"TODOLIST_Tasks/app/pkg/logging"
 	"TODOLIST_Tasks/app/pkg/utils/translator"
 	"context"
 	"database/sql"
@@ -18,67 +19,49 @@ import (
 
 type repositoryTasks struct {
 	ClientPostgres1 postgresql.Client
+	logger          logging.Logger
 }
 
-func (r *repositoryTasks) CreateTask(ctx context.Context, task model2.Task) (string, error) {
-	// Начинаем транзакцию
+func (r *repositoryTasks) CreateTask(ctx context.Context, task model2.Task) error {
 	tx, err := r.ClientPostgres1.Begin(ctx)
 	if err != nil {
-		return "", fmt.Errorf("failed to begin transaction: %w", err)
+		return fmt.Errorf("begin transaction: %w", err)
 	}
-	defer tx.Rollback(ctx)
+	defer func() {
+		_ = tx.Rollback(context.Background())
+	}()
 
-	// 1. Вставляем задачу в tasks с помощью squirrel
-	taskQuery, taskArgs, err := sq.
-		Insert("tasks").
-		Columns("task_id", "title", "description", "status", "priory", "due_date", "user_id", "tag_id").
-		Values(task.Id, task.Title, task.Description, translator.AntiTranslator(task.Status), task.Priory, task.DueDate, task.UserID, task.TagID).
-		Suffix("RETURNING task_id").
-		PlaceholderFormat(sq.Dollar).
-		ToSql()
-
+	// INSERT в основную таблицу tasks
+	_, err = tx.Exec(ctx, `
+        INSERT INTO tasks (task_id, title, description, status, priory, due_date, created_at, user_id, tag_id)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+    `, task.Id, task.Title, task.Description, task.Status, task.Priory, task.DueDate, time.Now(), task.UserID, task.TagID)
 	if err != nil {
-		return "", fmt.Errorf("failed to build task insert query: %w", err)
+		return fmt.Errorf("insert task: %w", err)
 	}
 
-	var taskID string
-	err = tx.QueryRow(ctx, taskQuery, taskArgs...).Scan(&taskID)
+	// INSERT в outbox для своих целей
+	eventData, _ := json.Marshal(task)
+	_, err = tx.Exec(ctx, `
+    INSERT INTO outbox_events (aggregate_type, aggregate_id, event_type, event_data, created_at)
+    VALUES ($1, $2, $3, $4, $5)
+`, "task", task.Id, "created", string(eventData), time.Now())
 	if err != nil {
-		return "", fmt.Errorf("ошибка при сохранении задачи: %w", err)
+		return fmt.Errorf("insert outbox: %w", err)
 	}
 
-	// 2. Вставляем событие в outbox_events в той же транзакции
-	eventData, err := json.Marshal(task)
-	if err != nil {
-		return "", fmt.Errorf("failed to marshal task for outbox: %w", err)
-	}
-
-	outboxQuery, outboxArgs, err := sq.
-		Insert("outbox_events").
-		Columns("id", "aggregate_type", "aggregate_id", "event_type", "event_data", "created_at").
-		Values(uuid.New(), "task", taskID, "save", eventData, time.Now().UTC()).
-		PlaceholderFormat(sq.Dollar).
-		ToSql()
-
-	if err != nil {
-		return "", fmt.Errorf("failed to build outbox insert query: %w", err)
-	}
-
-	_, err = tx.Exec(ctx, outboxQuery, outboxArgs...)
-	if err != nil {
-		return "", fmt.Errorf("failed to insert outbox event: %w", err)
-	}
-
-	// Коммитим транзакцию
+	// COMMIT
 	if err := tx.Commit(ctx); err != nil {
-		return "", fmt.Errorf("failed to commit transaction: %w", err)
+		return fmt.Errorf("commit failed: %w", err)
 	}
 
-	return taskID, nil
+	return nil
 }
 
 func (r *repositoryTasks) FindOneTask(ctx context.Context, id string) (model2.Task, error) {
 	var task model2.Task
+	var tagID sql.NullString
+	var tagName sql.NullString
 
 	query := `SELECT t.task_id, t.title, t.description, t.priory, t.status, t.due_date,
            t.created_at, t.user_id, t.tag_id, 
@@ -91,9 +74,22 @@ func (r *repositoryTasks) FindOneTask(ctx context.Context, id string) (model2.Ta
 	err := r.ClientPostgres1.QueryRow(ctx, query, id).Scan(
 		&task.Id, &task.Title, &task.Description, &task.Priory,
 		&task.Status, &task.DueDate, &task.CreatedAt,
-		&task.UserID, &task.TagID, &task.TagsName)
+		&task.UserID, &tagID, &tagName)
+
 	if err != nil && !errors.Is(err, ctx.Err()) {
 		return task, err
+	}
+
+	// Конвертируем sql.NullString в *string
+	if tagID.Valid {
+		tagIDStr := tagID.String
+		task.TagID = &tagIDStr
+	} else {
+		task.TagID = nil
+	}
+
+	if tagName.Valid {
+		task.TagsName = tagName.String
 	}
 
 	task.CreatedAt = task.CreatedAt.In(time.Local)
@@ -109,7 +105,7 @@ func (r *repositoryTasks) FindAllTasks(ctx context.Context, sortOptions postgres
 			"t.task_id", "t.title", "t.description", "t.priory",
 			"t.status", "t.due_date", "t.created_at", "t.user_id",
 			"t.tag_id",
-			"COALESCE(ct.name, dt.name) AS name", // Берем имя из любой таблицы тегов
+			"COALESCE(ct.name, dt.name) AS name",
 		).
 		From("public.tasks t").
 		LeftJoin("custom_tag ct ON t.tag_id = ct.tag_id").
@@ -147,13 +143,29 @@ func (r *repositoryTasks) FindAllTasks(ctx context.Context, sortOptions postgres
 
 	for rows.Next() {
 		var task model2.Task
+		var tagID sql.NullString
+		var tagName sql.NullString
+
 		if err := rows.Scan(
 			&task.Id, &task.Title, &task.Description, &task.Priory,
 			&task.Status, &task.DueDate, &task.CreatedAt, &task.UserID,
-			&task.TagID, &task.TagsName,
+			&tagID, &tagName,
 		); err != nil {
 			return nil, fmt.Errorf("ошибка чтения строки: %v", err)
 		}
+
+		// Конвертируем sql.NullString в *string
+		if tagID.Valid {
+			tagIDStr := tagID.String
+			task.TagID = &tagIDStr
+		} else {
+			task.TagID = nil
+		}
+
+		if tagName.Valid {
+			task.TagsName = tagName.String
+		}
+
 		tasks = append(tasks, task)
 	}
 
@@ -175,12 +187,12 @@ func (r *repositoryTasks) FindAllByTag(ctx context.Context, userId string, tagId
 			"COALESCE(ct.name, dt.name) AS name",
 		).
 		From("public.tasks t").
-		LeftJoin("custom_tag ct ON t.tag_id = ct.tag_id AND ct.user_id = ?", userId). // Только кастомные теги этого пользователя
-		LeftJoin("default_tag dt ON t.tag_id = dt.tag_id").                           // Все дефолтные теги
+		LeftJoin("custom_tag ct ON t.tag_id = ct.tag_id AND ct.user_id = ?", userId).
+		LeftJoin("default_tag dt ON t.tag_id = dt.tag_id").
 		Where(sq.Eq{"t.tag_id": tagId}).
 		Where(sq.Or{
-			sq.NotEq{"ct.tag_id": nil}, // Есть в кастомных тегах (у этого пользователя)
-			sq.NotEq{"dt.tag_id": nil}, // Или есть в дефолтных тегах
+			sq.NotEq{"ct.tag_id": nil},
+			sq.NotEq{"dt.tag_id": nil},
 		})
 
 	sqlStr, args, err := qb.ToSql()
@@ -197,10 +209,26 @@ func (r *repositoryTasks) FindAllByTag(ctx context.Context, userId string, tagId
 	var tasks []model2.Task
 	for rows.Next() {
 		var task model2.Task
+		var tagID sql.NullString
+		var tagName sql.NullString
+
 		if err := rows.Scan(&task.Id, &task.Title, &task.Description, &task.Priory, &task.Status,
-			&task.DueDate, &task.CreatedAt, &task.UserID, &task.TagID, &task.TagsName); err != nil {
+			&task.DueDate, &task.CreatedAt, &task.UserID, &tagID, &tagName); err != nil {
 			return nil, err
 		}
+
+		// Конвертируем sql.NullString в *string
+		if tagID.Valid {
+			tagIDStr := tagID.String
+			task.TagID = &tagIDStr
+		} else {
+			task.TagID = nil
+		}
+
+		if tagName.Valid {
+			task.TagsName = tagName.String
+		}
+
 		tasks = append(tasks, task)
 	}
 
@@ -299,16 +327,27 @@ func (r *repositoryTasks) UpdateTask(ctx context.Context, id string, task model2
 	// 2. Получаем обновленную задачу
 	var updatedTask model2.Task
 	var status string
+	var tagID sql.NullString
+
 	err = tx.QueryRow(ctx, `
 		SELECT task_id, title, description, status, priory, due_date, user_id, tag_id, created_at 
 		FROM tasks WHERE task_id = $1
 	`, id).Scan(
 		&updatedTask.Id, &updatedTask.Title, &updatedTask.Description, &status,
-		&updatedTask.Priory, &updatedTask.DueDate, &updatedTask.UserID, &updatedTask.TagID, &updatedTask.CreatedAt,
+		&updatedTask.Priory, &updatedTask.DueDate, &updatedTask.UserID, &tagID, &updatedTask.CreatedAt,
 	)
 	if err != nil {
 		return model2.Task{}, fmt.Errorf("ошибка при получении обновленной задачи: %w", err)
 	}
+
+	// Конвертируем sql.NullString в *string
+	if tagID.Valid {
+		tagIDStr := tagID.String
+		updatedTask.TagID = &tagIDStr
+	} else {
+		updatedTask.TagID = nil
+	}
+
 	updatedTask.Status = translator.Translator(status)
 
 	// 3. Вставляем событие в outbox
@@ -356,12 +395,14 @@ func (r *repositoryTasks) DeleteTask(ctx context.Context, id string) (string, er
 	// 1. Сначала получаем задачу для outbox
 	var task model2.Task
 	var status string
+	var tagID sql.NullString
+
 	err = tx.QueryRow(ctx, `
 		SELECT task_id, title, description, status, priory, due_date, user_id, tag_id, created_at 
 		FROM tasks WHERE task_id = $1
 	`, id).Scan(
 		&task.Id, &task.Title, &task.Description, &status,
-		&task.Priory, &task.DueDate, &task.UserID, &task.TagID, &task.CreatedAt,
+		&task.Priory, &task.DueDate, &task.UserID, &tagID, &task.CreatedAt,
 	)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -369,6 +410,15 @@ func (r *repositoryTasks) DeleteTask(ctx context.Context, id string) (string, er
 		}
 		return "", fmt.Errorf("ошибка при поиске задачи: %w", err)
 	}
+
+	// Конвертируем sql.NullString в *string
+	if tagID.Valid {
+		tagIDStr := tagID.String
+		task.TagID = &tagIDStr
+	} else {
+		task.TagID = nil
+	}
+
 	task.Status = translator.Translator(status)
 
 	// 2. Удаляем задачу
@@ -412,6 +462,6 @@ func (r *repositoryTasks) DeleteTask(ctx context.Context, id string) (string, er
 	return "delete ok", nil
 }
 
-func NewRepository(client postgresql.Client) postgres.Repository {
-	return &repositoryTasks{ClientPostgres1: client}
+func NewRepository(client postgresql.Client, logger logging.Logger) postgres.Repository {
+	return &repositoryTasks{ClientPostgres1: client, logger: logger}
 }

@@ -4,9 +4,9 @@ import (
 	"TODOLIST_Tasks/app/internal/apperror"
 	model2 "TODOLIST_Tasks/app/internal/tasks/model"
 	"TODOLIST_Tasks/app/internal/tasks/service"
-	signature "TODOLIST_Tasks/app/pkg/api/ signature"
 	"TODOLIST_Tasks/app/pkg/api/filter"
 	"TODOLIST_Tasks/app/pkg/api/resilience"
+	"TODOLIST_Tasks/app/pkg/api/signature"
 	sort2 "TODOLIST_Tasks/app/pkg/api/sort"
 	logging2 "TODOLIST_Tasks/app/pkg/logging"
 	"TODOLIST_Tasks/app/pkg/utils/CacheKey"
@@ -47,31 +47,54 @@ func (h *Handler) Register(router *httprouter.Router) {
 	router.HandlerFunc(http.MethodGet, taskURL, signature.Middleware(resilience.Middleware(apperror.Middleware(h.FindOne))))
 	router.HandlerFunc(http.MethodGet, tasksByUserURL, signature.Middleware(resilience.Middleware(filter.Middleware(sort2.MiddleWare(apperror.Middleware(h.GetList), "due_date", sort2.ASC)))))
 	router.HandlerFunc(http.MethodDelete, taskURL, signature.Middleware(apperror.Middleware(h.Delete)))
-	router.HandlerFunc(http.MethodGet, tasksByTags, signature.Middleware(resilience.Middleware(filter.Middleware(sort2.MiddleWare(apperror.Middleware(h.GetListByTag), "due_date", sort2.ASC)))))
+	router.HandlerFunc(
+		http.MethodGet, tasksByTags, signature.Middleware(resilience.Middleware(filter.Middleware(sort2.MiddleWare(apperror.Middleware(h.GetListByTag), "due_date", sort2.ASC)))))
 }
 func (h *Handler) Create(w http.ResponseWriter, r *http.Request) error {
-	h.logger.Info("CreateTask called")
+	h.logger.Info("🚀 Handler.Create START")
+	startTotal := time.Now()
+	defer func() {
+		h.logger.Infof("✅ Handler.Create TOTAL: %v", time.Since(startTotal))
+	}()
 
+	// 1. Извлечение параметров
+	paramStart := time.Now()
 	params := httprouter.ParamsFromContext(r.Context())
 	userId := params.ByName("userId")
+	paramTime := time.Since(paramStart)
+	h.logger.Infof("⏱️  Params extraction: %v", paramTime)
+
 	if userId == "" {
+		h.logger.Error("❌ Invalid user ID")
 		http.Error(w, "Invalid user ID", http.StatusBadRequest)
 		return nil
 	}
 
+	// 2. Чтение тела запроса
+	bodyReadStart := time.Now()
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
+		h.logger.Errorf("❌ Failed to read body: %v", err)
 		http.Error(w, "Failed to read request body", http.StatusInternalServerError)
 		return err
 	}
 	defer r.Body.Close()
+	bodyReadTime := time.Since(bodyReadStart)
+	h.logger.Infof("⏱️  Body read: %v, size: %d bytes", bodyReadTime, len(body))
 
+	// 3. Парсинг JSON
+	parseStart := time.Now()
 	var dto model2.TaskCreateDTO
 	if err := dto.UnmarshalJSON(body); err != nil {
+		h.logger.Errorf("❌ Invalid JSON: %v", err)
 		http.Error(w, "Invalid request payload", http.StatusBadRequest)
 		return err
 	}
+	parseTime := time.Since(parseStart)
+	h.logger.Infof("⏱️  JSON parsed: %v", parseTime)
 
+	// 4. Создание объекта Task
+	taskCreateStart := time.Now()
 	task := model2.Task{
 		Id:          uuid.New().String(),
 		Title:       dto.Title,
@@ -80,26 +103,51 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) error {
 		Status:      dto.Status,
 		DueDate:     dto.DueDate,
 		UserID:      userId,
-		TagID:       dto.TagID,
 		TagsName:    dto.TagName,
 	}
+	if dto.TagID != nil && *dto.TagID != "" {
+		task.TagID = dto.TagID
+	}
+	taskCreateTime := time.Since(taskCreateStart)
+	h.logger.Infof("⏱️  Task object created: %v", taskCreateTime)
+	h.logger.Infof("📝 Task created: ID=%s, User=%s, HasTag=%v",
+		task.Id, task.UserID, task.TagID != nil)
 
-	ctx, cancel := context.WithTimeout(r.Context(), 4*time.Second)
-
+	// 5. Вызов сервиса
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
-	taskResult, err := h.service.CreateTask(ctx, task)
+
+	serviceStart := time.Now()
+	err = h.service.CreateTaskRedis(ctx, task)
+	serviceTime := time.Since(serviceStart)
+	h.logger.Infof("⏱️  Service.CreateTask total: %v", serviceTime)
+
 	if err != nil {
+		h.logger.Errorf("❌ Service error: %v", err)
 		http.Error(w, "Failed to save task", http.StatusInternalServerError)
 		return err
 	}
 
+	// 6. Запись ответа
+	responseStart := time.Now()
 	w.WriteHeader(http.StatusCreated)
-	w.Write([]byte(fmt.Sprintf("Task created with ID: %s", taskResult.Id)))
+	n, err := w.Write([]byte(fmt.Sprintf("Task created with ID: %s", task.Id)))
+	responseTime := time.Since(responseStart)
+	if err != nil {
+		h.logger.Errorf("❌ Failed to write response: %v, bytesWritten=%d", err, n)
+	} else {
+		h.logger.Infof("✅ Response written successfully, bytes: %d, duration: %v", n, responseTime)
+	}
 
-	go func(taskResult model2.Task) {
-		_ = h.service.CreateTaskRedis(context.Background(), taskResult)
-	}(taskResult)
-
+	go func(task model2.Task) {
+		ctxPostgres, cancelPostgres := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancelPostgres()
+		var postgresErr error
+		postgresErr = h.service.CreateTask(ctxPostgres, task)
+		if postgresErr != nil {
+			h.logger.Info(postgresErr)
+		}
+	}(task)
 	return nil
 }
 

@@ -1,3 +1,4 @@
+// client/postgres/pgxClient.go
 package postgres
 
 import (
@@ -5,37 +6,139 @@ import (
 	"TODOLIST_Tasks/app/pkg/utils/repeatable"
 	"context"
 	"fmt"
+	"log"
+	"time"
+
 	"github.com/jackc/pgconn"
 	"github.com/jackc/pgx/v4"
 	"github.com/jackc/pgx/v4/pgxpool"
-
-	"time"
 )
 
 type Client interface {
 	Exec(ctx context.Context, query string, args ...interface{}) (pgconn.CommandTag, error)
 	Query(ctx context.Context, query string, args ...interface{}) (pgx.Rows, error)
 	QueryRow(ctx context.Context, query string, args ...interface{}) pgx.Row
+
+	// Transaction support
+	BeginTx(ctx context.Context, opts pgx.TxOptions) (pgx.Tx, error)
 	Begin(ctx context.Context) (pgx.Tx, error)
+
+	// COPY support - ДОБАВЛЕНО!
+	CopyFrom(ctx context.Context, tableName pgx.Identifier, columnNames []string, rowSrc pgx.CopyFromSource) (int64, error)
+
 	Close()
+	Pool() *pgxpool.Pool
+	PrintStats()
 }
 
-func NewClient(ctx context.Context, maxAttempts int, sc config.StoragePostgresTasks) (pool *pgxpool.Pool, err error) {
+type pgxClient struct {
+	pool *pgxpool.Pool
+}
 
-	dsn := fmt.Sprintf("postgresql://%s:%s@%s:%s/%s", sc.Username, sc.Password, sc.Host, sc.Port, sc.Database)
-	err = repeatable.DoWithTries(func() error {
-		ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		defer cancel()
-		pool, err = pgxpool.Connect(ctx, dsn)
-		if err != nil {
-			return err
-		}
-		return nil
-	}, maxAttempts, 5*time.Second)
+func (c *pgxClient) Exec(ctx context.Context, query string, args ...interface{}) (pgconn.CommandTag, error) {
+	return c.pool.Exec(ctx, query, args...)
+}
+
+func (c *pgxClient) Query(ctx context.Context, query string, args ...interface{}) (pgx.Rows, error) {
+	return c.pool.Query(ctx, query, args...)
+}
+
+func (c *pgxClient) QueryRow(ctx context.Context, query string, args ...interface{}) pgx.Row {
+	return c.pool.QueryRow(ctx, query, args...)
+}
+
+func (c *pgxClient) Begin(ctx context.Context) (pgx.Tx, error) {
+	return c.pool.BeginTx(ctx, pgx.TxOptions{
+		IsoLevel: pgx.ReadCommitted,
+	})
+}
+
+func (c *pgxClient) BeginTx(ctx context.Context, opts pgx.TxOptions) (pgx.Tx, error) {
+	return c.pool.BeginTx(ctx, opts)
+}
+
+// ДОБАВЛЕНО: CopyFrom через пул
+func (c *pgxClient) CopyFrom(ctx context.Context, tableName pgx.Identifier, columnNames []string, rowSrc pgx.CopyFromSource) (int64, error) {
+	return c.pool.CopyFrom(ctx, tableName, columnNames, rowSrc)
+}
+
+func (c *pgxClient) Close() {
+	c.pool.Close()
+}
+
+func (c *pgxClient) Pool() *pgxpool.Pool {
+	return c.pool
+}
+
+func (c *pgxClient) PrintStats() {
+	stats := c.pool.Stat()
+	log.Printf(
+		"PG POOL STATS: Total=%d Idle=%d Acquired=%d AcquireCount=%d Wait=%s",
+		stats.TotalConns(),
+		stats.IdleConns(),
+		stats.AcquiredConns(),
+		stats.AcquireCount(),
+		stats.AcquireDuration(),
+	)
+}
+
+// NewClient остается без изменений
+func NewClient(ctx context.Context, maxAttempts int, sc config.Config) (Client, error) {
+	usePgBouncer := sc.Postgres.Port == "6432" || sc.Postgres.Host == "pgbouncer"
+
+	dsn := fmt.Sprintf(
+		"postgresql://%s:%s@%s:%s/%s?sslmode=disable",
+		sc.Postgres.Username,
+		sc.Postgres.Password,
+		sc.Postgres.Host,
+		sc.Postgres.Port,
+		sc.Postgres.Database,
+	)
+
+	poolConfig, err := pgxpool.ParseConfig(dsn)
 	if err != nil {
-
+		return nil, fmt.Errorf("failed to parse pg config: %w", err)
 	}
 
-	return pool, nil
+	poolConfig.MaxConns = 80
+	poolConfig.MinConns = 10
+	poolConfig.MaxConnLifetime = 30 * time.Minute
+	poolConfig.MaxConnLifetimeJitter = 5 * time.Minute
+	poolConfig.MaxConnIdleTime = 2 * time.Minute
+	poolConfig.HealthCheckPeriod = 30 * time.Second
 
+	if !usePgBouncer {
+		poolConfig.ConnConfig.RuntimeParams["jit"] = "off"
+		poolConfig.ConnConfig.RuntimeParams["work_mem"] = "16MB"
+		poolConfig.ConnConfig.RuntimeParams["effective_cache_size"] = "4GB"
+		poolConfig.ConnConfig.RuntimeParams["statement_timeout"] = "10000"
+		poolConfig.ConnConfig.RuntimeParams["idle_in_transaction_session_timeout"] = "30000"
+		poolConfig.ConnConfig.RuntimeParams["synchronous_commit"] = "off"
+	} else {
+		poolConfig.ConnConfig.RuntimeParams = make(map[string]string)
+		poolConfig.ConnConfig.RuntimeParams["application_name"] = "tasks-service"
+		poolConfig.ConnConfig.PreferSimpleProtocol = true
+	}
+
+	poolConfig.ConnConfig.ConnectTimeout = 2 * time.Second
+
+	var pool *pgxpool.Pool
+
+	err = repeatable.DoWithTries(func() error {
+		ctxTimeout, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+
+		pool, err = pgxpool.ConnectConfig(ctxTimeout, poolConfig)
+		if err != nil {
+			return fmt.Errorf("connect to pg: %w", err)
+		}
+
+		return pool.Ping(ctxTimeout)
+	}, maxAttempts, 5*time.Second)
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to postgres after %d attempts: %w", maxAttempts, err)
+	}
+
+	return &pgxClient{pool: pool}, nil
 }

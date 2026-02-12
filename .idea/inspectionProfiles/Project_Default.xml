@@ -4,6 +4,7 @@
     <inspection_tool class="GoDfaErrorMayBeNotNil" enabled="true" level="WARNING" enabled_by_default="true">
       <functions>
         <function importPath="TODOLIST_Tasks/app/pkg/client/redis" name="NewClient" />
+        <function importPath="TODOLIST_Tasks/app/internal/config" name="GetConfig" />
       </functions>
     </inspection_tool>
   </profile>

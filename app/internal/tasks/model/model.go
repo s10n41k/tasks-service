@@ -10,7 +10,7 @@ type Task struct {
 	Status      string    `db:"status" json:"status"`
 	DueDate     time.Time `db:"due_date" json:"due_date"`
 	UserID      string    `db:"user_id" json:"user_id"`
-	TagID       string    `db:"tag_id" json:"tag_id"`
+	TagID       *string   `json:"tag_id,omitempty"`
 	TagsName    string    `db:"tags_name" json:"tags_name"`
 	CreatedAt   time.Time `db:"created_at" json:"created_at"`
 }
