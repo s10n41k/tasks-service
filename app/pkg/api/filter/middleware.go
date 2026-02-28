@@ -6,8 +6,10 @@ import (
 	"strings"
 )
 
+type contextKey string
+
 const (
-	OptionsContextKey = "filter_options"
+	OptionsContextKey contextKey = "filter_options"
 )
 
 func Middleware(h http.HandlerFunc) http.HandlerFunc {
@@ -41,7 +43,7 @@ func Middleware(h http.HandlerFunc) http.HandlerFunc {
 		}
 
 		// Сохраняем фильтры в контексте
-		ctx := context.WithValue(r.Context(), "filter_options", filters)
+		ctx := context.WithValue(r.Context(), OptionsContextKey, filters)
 		r = r.WithContext(ctx)
 		h(w, r)
 	}

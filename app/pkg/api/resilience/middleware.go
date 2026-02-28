@@ -2,33 +2,47 @@ package resilience
 
 import (
 	"bytes"
+	"errors"
 	"github.com/sony/gobreaker"
 	"golang.org/x/time/rate"
 	"io"
 	"log"
 	"net/http"
+	"sync"
 	"time"
 )
 
 const maxRetries = 3
 const baseDelay = 50 * time.Millisecond
 
+var (
+	cbOnce sync.Once
+	cb     *gobreaker.CircuitBreaker
+)
+
+func getCircuitBreaker() *gobreaker.CircuitBreaker {
+	cbOnce.Do(func() {
+		cbSettings := gobreaker.Settings{
+			Name:        "global-circuit-breaker",
+			MaxRequests: 10,
+			Timeout:     10 * time.Second,
+			ReadyToTrip: func(c gobreaker.Counts) bool {
+				failRatio := float64(c.TotalFailures) / float64(c.Requests)
+				return c.Requests >= 5 && failRatio >= 0.5
+			},
+		}
+		cb = gobreaker.NewCircuitBreaker(cbSettings)
+	})
+	return cb
+}
+
 func Middleware(handlerFunc http.HandlerFunc) http.HandlerFunc {
-	cbSettings := gobreaker.Settings{
-		Name:        "global-circuit-breaker",
-		MaxRequests: 10,
-		Timeout:     10 * time.Second,
-		ReadyToTrip: func(c gobreaker.Counts) bool {
-			failRatio := float64(c.TotalFailures) / float64(c.Requests)
-			return c.Requests >= 5 && failRatio >= 0.5
-		},
-	}
-	cb := gobreaker.NewCircuitBreaker(cbSettings)
-	limiter := rate.NewLimiter(rate.Limit(1000), 1000)
+	breaker := getCircuitBreaker()
+	limiter := rate.NewLimiter(rate.Limit(10000), 10000)
 
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !limiter.Allow() {
-			http.Error(w, "Too many requests", http.StatusTooManyRequests)
+			http.Error(w, `{"error":"too many requests"}`, http.StatusTooManyRequests)
 			return
 		}
 
@@ -36,33 +50,103 @@ func Middleware(handlerFunc http.HandlerFunc) http.HandlerFunc {
 
 		for attempt := 0; attempt < maxRetries; attempt++ {
 			buf := &bytes.Buffer{}
-			rec := &responseRecorder{ResponseWriter: w, body: buf, status: http.StatusOK}
+			rec := &responseRecorder{
+				body:    buf,
+				headers: make(http.Header),
+				status:  http.StatusOK,
+			}
 
-			_, err := cb.Execute(func() (interface{}, error) {
+			_, err := breaker.Execute(func() (interface{}, error) {
 				handlerFunc(rec, r)
+				if rec.status >= 500 {
+					return nil, &serverError{status: rec.status}
+				}
 				return nil, nil
 			})
 
-			if err == nil && rec.status < 500 {
+			if err == nil {
+				// Copy captured headers to the real response
+				for k, vals := range rec.headers {
+					for _, v := range vals {
+						w.Header().Add(k, v)
+					}
+				}
 				w.WriteHeader(rec.status)
 				_, _ = io.Copy(w, bytes.NewReader(buf.Bytes()))
 				return
 			}
 
 			lastErr = err
-			log.Printf("[Middleware] Attempt %d/%d failed: %v", attempt+1, maxRetries, err)
+			log.Printf("[Resilience] attempt %d/%d failed: %v", attempt+1, maxRetries, err)
 			time.Sleep(time.Duration(1<<attempt) * baseDelay)
 		}
 
-		http.Error(w, "Service temporarily unavailable", http.StatusServiceUnavailable)
-		log.Printf("[Middleware] Handler failed after %d retries: %v", maxRetries, lastErr)
+		http.Error(w, `{"error":"service temporarily unavailable"}`, http.StatusServiceUnavailable)
+		log.Printf("[Resilience] handler failed after %d retries: %v", maxRetries, lastErr)
 	}
 }
 
-type responseRecorder struct {
-	http.ResponseWriter
-	body   *bytes.Buffer
+// WriteMiddleware applies rate limiting and circuit breaker WITHOUT retries.
+// Safe for non-idempotent operations (POST, DELETE) — retrying writes causes duplicates.
+func WriteMiddleware(handlerFunc http.HandlerFunc) http.HandlerFunc {
+	breaker := getCircuitBreaker()
+	limiter := rate.NewLimiter(rate.Limit(10000), 10000)
+
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !limiter.Allow() {
+			http.Error(w, `{"error":"too many requests"}`, http.StatusTooManyRequests)
+			return
+		}
+
+		buf := &bytes.Buffer{}
+		rec := &responseRecorder{
+			body:    buf,
+			headers: make(http.Header),
+			status:  http.StatusOK,
+		}
+
+		_, cbErr := breaker.Execute(func() (interface{}, error) {
+			handlerFunc(rec, r)
+			if rec.status >= 500 {
+				return nil, &serverError{status: rec.status}
+			}
+			return nil, nil
+		})
+
+		// Circuit breaker open — handler was NOT called, return 503 immediately
+		if errors.Is(cbErr, gobreaker.ErrOpenState) || errors.Is(cbErr, gobreaker.ErrTooManyRequests) {
+			http.Error(w, `{"error":"service temporarily unavailable"}`, http.StatusServiceUnavailable)
+			log.Printf("[WriteResilience] circuit breaker open, rejecting write request")
+			return
+		}
+
+		// Handler was called — write its captured response (including 5xx)
+		for k, vals := range rec.headers {
+			for _, v := range vals {
+				w.Header().Add(k, v)
+			}
+		}
+		w.WriteHeader(rec.status)
+		_, _ = io.Copy(w, bytes.NewReader(buf.Bytes()))
+	}
+}
+
+type serverError struct {
 	status int
+}
+
+func (e *serverError) Error() string {
+	return http.StatusText(e.status)
+}
+
+type responseRecorder struct {
+	body    *bytes.Buffer
+	headers http.Header
+	status  int
+}
+
+func (r *responseRecorder) Header() http.Header {
+	return r.headers
 }
 
 func (r *responseRecorder) WriteHeader(code int) {

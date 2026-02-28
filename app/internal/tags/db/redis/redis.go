@@ -39,7 +39,7 @@ func (r *repositoryRedis) UpdateTagsRedis(ctx context.Context, id string, tags m
 		return err
 	}
 
-	key := fmt.Sprintf("user:%s:tag:%s", id, userID)
+	key := fmt.Sprintf("user:%s:tag:%s", userID, id)
 	err = r.Client.Set(ctx, key, data, 24*time.Hour).Err()
 	if err != nil {
 		return err
@@ -49,7 +49,7 @@ func (r *repositoryRedis) UpdateTagsRedis(ctx context.Context, id string, tags m
 }
 
 func (r *repositoryRedis) DeleteTagsRedis(ctx context.Context, id string, userID string) error {
-	key := fmt.Sprintf("user:%s:tag:%s", id, userID)
+	key := fmt.Sprintf("user:%s:tag:%s", userID, id)
 	err := r.Client.Del(ctx, key).Err()
 	if err != nil {
 		return err
@@ -59,7 +59,7 @@ func (r *repositoryRedis) DeleteTagsRedis(ctx context.Context, id string, userID
 }
 
 func (r *repositoryRedis) FindOneTagsRedis(ctx context.Context, id string, userID string) (model.Tags, error) {
-	key := fmt.Sprintf("user:%s:tag:%s", id, userID)
+	key := fmt.Sprintf("user:%s:tag:%s", userID, id)
 	result, err := r.Client.Get(ctx, key).Result()
 	if err != nil {
 		return model.Tags{}, err

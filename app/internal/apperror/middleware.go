@@ -20,12 +20,11 @@ func Middleware(handler appHandler) http.HandlerFunc {
 					w.Write(ErrNotFound.Marshal())
 					return
 				}
-				err = err.(*AppError)
 				w.WriteHeader(http.StatusBadRequest)
 				w.Write(appErr.Marshal())
 				return
 			}
-			w.WriteHeader(http.StatusTeapot)
+			w.WriteHeader(http.StatusInternalServerError)
 			w.Write(systemError(err).Marshal())
 
 		}

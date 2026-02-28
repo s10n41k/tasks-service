@@ -1,21 +1,21 @@
 package kafka
 
 import (
-	"TODOLIST_Tasks/app/internal/tasks/model"
+	"TODOLIST_Tasks/app/internal/tasks/domain"
+	"TODOLIST_Tasks/app/internal/tasks/repository/outbox"
+	kafkaclient "TODOLIST_Tasks/app/pkg/client/kafka"
+	"TODOLIST_Tasks/app/pkg/logging"
 	"context"
 	"encoding/json"
 	"fmt"
 	"time"
-
-	kafkaclient "TODOLIST_Tasks/app/pkg/client/kafka"
-	"TODOLIST_Tasks/app/pkg/logging"
 )
 
-const (
-	TypeSave   = "save"
-	TypeUpdate = "update"
-	TypeDelete = "delete"
-)
+type kafkaPayload struct {
+	Task      outbox.TaskPayload `json:"task"`
+	Type      string             `json:"type"`
+	Timestamp time.Time          `json:"timestamp"`
+}
 
 type producer struct {
 	client kafkaclient.Client
@@ -29,25 +29,35 @@ func NewRepository(client kafkaclient.Client) Repository {
 	}
 }
 
-func (p *producer) Write(ctx context.Context, task model.Task, eventType string) error {
-	evt := model.EventTask{
-		Task:      task,
+func (p *producer) Write(ctx context.Context, task domain.Task, eventType string) error {
+	payload := kafkaPayload{
+		Task: outbox.TaskPayload{
+			ID:          task.ID,
+			Title:       task.Title,
+			Description: task.Description,
+			Priority:    task.Priority,
+			Status:      string(task.Status),
+			DueDate:     task.DueDate,
+			UserID:      task.UserID,
+			TagID:       task.TagID,
+			TagName:     task.TagName,
+			CreatedAt:   task.CreatedAt,
+		},
 		Type:      eventType,
 		Timestamp: time.Now().UTC(),
 	}
 
-	p.logger.Infof("Producing %s event for task %s", eventType, task.Id)
+	p.logger.Infof("producing %s event for task %s", eventType, task.ID)
 
-	data, err := json.Marshal(evt)
+	data, err := json.Marshal(payload)
 	if err != nil {
-		return fmt.Errorf("marshal event failed: %w", err)
+		return fmt.Errorf("marshal kafka event: %w", err)
+	}
+	if err := p.client.Write(ctx, task.ID, data); err != nil {
+		return fmt.Errorf("kafka write: %w", err)
 	}
 
-	if err := p.client.Write(ctx, task.Id, data); err != nil {
-		return fmt.Errorf("kafka write failed: %w", err)
-	}
-
-	p.logger.Infof("Successfully produced %s event for task %s", eventType, task.Id)
+	p.logger.Infof("sent %s event for task %s", eventType, task.ID)
 	return nil
 }
 

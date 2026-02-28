@@ -14,16 +14,19 @@ import (
 	"github.com/julienschmidt/httprouter"
 	"io"
 	"net/http"
+	"time"
 )
 
 const (
 	tagURL        = "/v1/users/:userId/tags/:tagsId"
 	tagsByUserURL = "/v1/users/:userId/tags"
+
+	goroutineTimeout = 5 * time.Second
 )
 
 type handler struct {
 	service *service2.Service
-	logger  *logging2.Logger // добавляем логгер
+	logger  *logging2.Logger
 }
 
 func NewHandler(service *service2.Service) handlers.Handler {
@@ -31,7 +34,6 @@ func NewHandler(service *service2.Service) handlers.Handler {
 		service: service,
 		logger:  logging2.GetLogger().GetLoggerWithField("handler", "tags"),
 	}
-
 }
 
 func (h *handler) Register(router *httprouter.Router) {
@@ -51,16 +53,14 @@ func (h *handler) CreateTag(w http.ResponseWriter, r *http.Request) error {
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		h.logger.Errorf("failed to read request body: %v", err)
-		http.Error(w, "Failed to read request body", http.StatusInternalServerError)
 		return err
 	}
 	defer r.Body.Close()
 
 	var tagDTO model.TagsDTO
-	if err = json.Unmarshal(body, &tagDTO); err != nil {
+	if err := json.Unmarshal(body, &tagDTO); err != nil {
 		h.logger.Errorf("failed to unmarshal request body: %v", err)
-		http.Error(w, "Invalid request payload", http.StatusBadRequest)
-		return err
+		return apperror.BadRequest("Invalid request payload", err.Error())
 	}
 
 	tag := model.Tags{
@@ -72,21 +72,22 @@ func (h *handler) CreateTag(w http.ResponseWriter, r *http.Request) error {
 	result, err := h.service.CreateTags(ctx, tag, userId)
 	if err != nil {
 		h.logger.Errorf("failed to create tag: %v", err)
-		http.Error(w, "Failed to create tag", http.StatusInternalServerError)
 		return err
 	}
 	tag.Id = result
 
-	h.logger.Infof("Tag created successfully with id: %s", result)
+	h.logger.Infof("tag created successfully with id: %s", result)
 
 	w.WriteHeader(http.StatusCreated)
 	w.Write([]byte(fmt.Sprintf("Tag created: %s", result)))
 
-	go func(result string, userId string) {
-		if err = h.service.CreateTagsRedis(context.Background(), tag, userId); err != nil {
-			h.logger.Errorf("failed to create tag redis: %v", err)
+	go func(tag model.Tags, userId string) {
+		bgCtx, bgCancel := context.WithTimeout(context.Background(), goroutineTimeout)
+		defer bgCancel()
+		if cacheErr := h.service.CreateTagsRedis(bgCtx, tag, userId); cacheErr != nil {
+			h.logger.Errorf("failed to cache tag in Redis: %v", cacheErr)
 		}
-	}(result, userId)
+	}(tag, userId)
 
 	return nil
 }
@@ -111,15 +112,17 @@ func (h *handler) Delete(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 
-	h.logger.Infof("Tag with ID %s deleted successfully", tagId)
+	h.logger.Infof("tag with ID %s deleted successfully", tagId)
 
 	response := map[string]string{"message": "successful delete"}
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(response)
 
-	go func(id string, userID string) {
-		if err = h.service.DeleteTagsRedis(context.Background(), id, userId); err != nil {
-			h.logger.Errorf("failed to delete tag redis with id %s: %v", id, err)
+	go func(tagId string, userId string) {
+		bgCtx, bgCancel := context.WithTimeout(context.Background(), goroutineTimeout)
+		defer bgCancel()
+		if delErr := h.service.DeleteTagsRedis(bgCtx, tagId, userId); delErr != nil {
+			h.logger.Errorf("failed to delete tag %s from Redis: %v", tagId, delErr)
 		}
 	}(tagId, userId)
 
@@ -137,8 +140,8 @@ func (h *handler) GetList(w http.ResponseWriter, r *http.Request) error {
 		return nil
 	}
 
-	// 1. Пробуем достать теги из Redis
-	tagsRedis, err := h.service.FindALlTagsRedis(r.Context(), userId)
+	// Try Redis cache first
+	tagsRedis, err := h.service.FindAllTagsRedis(r.Context(), userId)
 	if err == nil && len(tagsRedis) > 0 {
 		h.logger.Infof("found %d tags for userID %s in Redis", len(tagsRedis), userId)
 
@@ -152,7 +155,7 @@ func (h *handler) GetList(w http.ResponseWriter, r *http.Request) error {
 		return nil
 	}
 
-	// 2. Ищем в PostgreSQL, если в Redis нет
+	// Fallback to PostgreSQL
 	tags, err := h.service.FindAllTags(r.Context(), userId)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) || len(tags) == 0 {
@@ -165,7 +168,6 @@ func (h *handler) GetList(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 
-	// 3. Отправляем ответ клиенту
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	if err := json.NewEncoder(w).Encode(tags); err != nil {
@@ -175,10 +177,12 @@ func (h *handler) GetList(w http.ResponseWriter, r *http.Request) error {
 
 	h.logger.Infof("returned %d tags from DB for userID: %s", len(tags), userId)
 
-	// 4. Кэшируем в Redis асинхронно
+	// Cache asynchronously
 	go func(tags []model.Tags, userId string) {
-		if err := h.service.SetTagList(context.Background(), userId, tags); err != nil {
-			h.logger.Errorf("failed to cache tags in Redis: %v", err)
+		bgCtx, bgCancel := context.WithTimeout(context.Background(), goroutineTimeout)
+		defer bgCancel()
+		if cacheErr := h.service.SetTagList(bgCtx, userId, tags); cacheErr != nil {
+			h.logger.Errorf("failed to cache tags in Redis: %v", cacheErr)
 		}
 	}(tags, userId)
 
@@ -197,20 +201,14 @@ func (h *handler) FindOne(w http.ResponseWriter, r *http.Request) error {
 		return errors.New("invalid user ID or tag ID")
 	}
 
+	// Try Redis cache first
 	tagRedis, err := h.service.FindOneTagsRedis(r.Context(), tagId, userId)
 	if err == nil && tagRedis.Id != "" {
-		h.logger.Infof("Task with ID %s and userID %s found in Redis", tagId, userId)
-
-		// Отправляем задачу из Redis
-		response := model.Tags{
-			Id:     tagRedis.Id,
-			Name:   tagRedis.Name,
-			UserID: tagRedis.UserID,
-		}
+		h.logger.Infof("tag with ID %s found in Redis", tagId)
 
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		if err := json.NewEncoder(w).Encode(response); err != nil {
+		if err := json.NewEncoder(w).Encode(tagRedis); err != nil {
 			h.logger.Errorf("failed to encode response: %v", err)
 			http.Error(w, "Error encoding response", http.StatusInternalServerError)
 			return err
@@ -218,10 +216,11 @@ func (h *handler) FindOne(w http.ResponseWriter, r *http.Request) error {
 		return nil
 	}
 
+	// Fallback to PostgreSQL
 	tags, err := h.service.FindOneTags(r.Context(), tagId, userId)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			h.logger.Warnf("tag with ID %s and userID %s not found", tagId, userId)
+			h.logger.Warnf("tag with ID %s not found", tagId)
 			http.Error(w, "Tag not found", http.StatusNotFound)
 			return nil
 		}
@@ -230,25 +229,21 @@ func (h *handler) FindOne(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 
-	response := model.Tags{
-		Id:     tags.Id,
-		Name:   tags.Name,
-		UserID: tags.UserID,
-	}
-
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	err = json.NewEncoder(w).Encode(response)
-	if err != nil {
+	if err := json.NewEncoder(w).Encode(tags); err != nil {
 		h.logger.Errorf("failed to encode response: %v", err)
 		return err
 	}
 
 	h.logger.Infof("tag with ID %s retrieved successfully", tagId)
 
+	// Cache asynchronously
 	go func(tag model.Tags, userId string) {
-		if err = h.service.CreateTagsRedis(context.Background(), tags, userId); err != nil {
-			h.logger.Errorf("failed to create tag redis: %v", err)
+		bgCtx, bgCancel := context.WithTimeout(context.Background(), goroutineTimeout)
+		defer bgCancel()
+		if cacheErr := h.service.CreateTagsRedis(bgCtx, tag, userId); cacheErr != nil {
+			h.logger.Errorf("failed to cache tag in Redis: %v", cacheErr)
 		}
 	}(tags, userId)
 
@@ -281,23 +276,23 @@ func (h *handler) UpdateTag(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 
-	h.logger.Infof("Tag with ID %s updated successfully", tagId)
+	h.logger.Infof("tag with ID %s updated successfully", tagId)
 
 	response := map[string]string{"message": "successful update"}
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(response)
 
-	go func() {
-		if err = h.service.DeleteTagsRedis(r.Context(), tagId, userId); err != nil {
-			h.logger.Errorf("failed to delete tag redis: %v", err)
+	go func(tagId string, userId string, tagRequest model.TagsDTO) {
+		bgCtx, bgCancel := context.WithTimeout(context.Background(), goroutineTimeout)
+		defer bgCancel()
+		if delErr := h.service.DeleteTagsRedis(bgCtx, tagId, userId); delErr != nil {
+			h.logger.Errorf("failed to delete tag from Redis: %v", delErr)
 			return
 		}
-
-		if err = h.service.UpdateTagsRedis(context.Background(), tagId, tagRequest, userId); err != nil {
-			h.logger.Errorf("failed to update tag redis: %v", err)
+		if updErr := h.service.UpdateTagsRedis(bgCtx, tagId, tagRequest, userId); updErr != nil {
+			h.logger.Errorf("failed to update tag in Redis: %v", updErr)
 		}
-	}()
+	}(tagId, userId, tagRequest)
 
 	return nil
-
 }

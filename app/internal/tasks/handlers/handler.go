@@ -2,7 +2,9 @@ package handlers
 
 import (
 	"TODOLIST_Tasks/app/internal/apperror"
-	model2 "TODOLIST_Tasks/app/internal/tasks/model"
+	"TODOLIST_Tasks/app/internal/tasks/domain"
+	"TODOLIST_Tasks/app/internal/tasks/dto"
+	"TODOLIST_Tasks/app/internal/tasks/port"
 	"TODOLIST_Tasks/app/internal/tasks/service"
 	"TODOLIST_Tasks/app/pkg/api/filter"
 	"TODOLIST_Tasks/app/pkg/api/resilience"
@@ -10,150 +12,294 @@ import (
 	sort2 "TODOLIST_Tasks/app/pkg/api/sort"
 	logging2 "TODOLIST_Tasks/app/pkg/logging"
 	"TODOLIST_Tasks/app/pkg/utils/CacheKey"
-	"TODOLIST_Tasks/app/pkg/utils/translator"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/google/uuid"
-	"github.com/julienschmidt/httprouter"
 	"io"
 	"net/http"
+	"strings"
 	"time"
+
+	"github.com/google/uuid"
+	"github.com/julienschmidt/httprouter"
 )
 
 const (
 	taskURL        = "/tasks/:uuid"
 	tasksByUserURL = "/v1/users/:userId/tasks"
 	tasksByTags    = "/v1/users/:userId/tags/:tagsId/tasks"
+
+	goroutineTimeout      = 5 * time.Second
+	redisConcurrencyLimit = 500
+
+	batchChannelSize = 10000
+	batchMaxSize     = 500
+	batchFlushMs     = 10
+
+	deleteBatchChannelSize = 10000
+	deleteBatchMaxSize     = 500
+	deleteBatchFlushMs     = 10
 )
 
-type Handler struct {
-	service *service.Service
-	logger  *logging2.Logger
+type deleteItem struct {
+	id     string
+	userID string
 }
 
-func NewHandler(service *service.Service) *Handler {
-	return &Handler{
-		service: service,
-		logger:  logging2.GetLogger().GetLoggerWithField("handler", "tasks"),
+type Handler struct {
+	cmd           service.TaskCommandService
+	query         service.TaskQueryService
+	cache         service.TaskCacheService
+	logger        *logging2.Logger
+	redisSema     chan struct{}
+	batchCh       chan domain.Task
+	deleteBatchCh chan deleteItem
+}
+
+func NewHandler(cmd service.TaskCommandService, query service.TaskQueryService, cache service.TaskCacheService) *Handler {
+	h := &Handler{
+		cmd:           cmd,
+		query:         query,
+		cache:         cache,
+		logger:        logging2.GetLogger().GetLoggerWithField("handler", "tasks"),
+		redisSema:     make(chan struct{}, redisConcurrencyLimit),
+		batchCh:       make(chan domain.Task, batchChannelSize),
+		deleteBatchCh: make(chan deleteItem, deleteBatchChannelSize),
+	}
+	go h.startBatchWorker()
+	go h.startDeleteBatchWorker()
+	return h
+}
+
+// --- Маппинг DTO ↔ Domain ---
+
+// dtoToEntity маппит входной DTO в доменную сущность.
+func dtoToEntity(userID string, req dto.CreateTaskRequest) domain.Task {
+	task := domain.Task{
+		ID:          uuid.New().String(),
+		Title:       req.Title,
+		Description: req.Description,
+		Priority:    req.Priority,
+		Status:      domain.NewStatus(req.Status),
+		DueDate:     req.DueDate,
+		UserID:      userID,
+		TagName:     req.TagName,
+	}
+	if req.TagID != nil && *req.TagID != "" {
+		task.TagID = req.TagID
+	}
+	return task
+}
+
+// entityToResponse маппит доменную сущность в HTTP-ответ.
+func entityToResponse(t domain.Task) dto.TaskResponse {
+	return dto.TaskResponse{
+		ID:          t.ID,
+		Title:       t.Title,
+		Description: t.Description,
+		Priority:    t.Priority,
+		Status:      string(t.Status),
+		DueDate:     t.DueDate.Format("02-01-2006 15:04"),
+		CreatedAt:   t.CreatedAt.Format("02-01-2006 15:04"),
+		UserID:      t.UserID,
+		TagName:     t.TagName,
 	}
 }
 
+// updateRequestToPatch конвертирует HTTP-патч в port.UpdatePatch с доменными типами.
+func updateRequestToPatch(req dto.UpdateTaskRequest) port.UpdatePatch {
+	patch := port.UpdatePatch{
+		Title:       req.Title,
+		Description: req.Description,
+		Priority:    req.Priority,
+		TagName:     req.TagName,
+	}
+	if req.Status != nil {
+		s := domain.NewStatus(*req.Status)
+		patch.Status = &s
+	}
+	if req.DueDate != nil {
+		t := time.Time(*req.DueDate)
+		patch.DueDate = &t
+	}
+	return patch
+}
+
+// --- Batch workers ---
+
+func (h *Handler) startBatchWorker() {
+	ticker := time.NewTicker(batchFlushMs * time.Millisecond)
+	defer ticker.Stop()
+	batch := make([]domain.Task, 0, batchMaxSize)
+
+	for {
+		select {
+		case task := <-h.batchCh:
+			batch = append(batch, task)
+			if len(batch) >= batchMaxSize {
+				h.flushBatch(batch)
+				batch = batch[:0]
+			}
+		case <-ticker.C:
+			if len(batch) > 0 {
+				h.flushBatch(batch)
+				batch = batch[:0]
+			}
+		}
+	}
+}
+
+// flushBatch сохраняет накопленные задачи в БД.
+// Задачи с TagName вставляются по одной (резолв тега через CTE),
+// остальные — одним батч-INSERT.
+func (h *Handler) flushBatch(tasks []domain.Task) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	simple := tasks[:0:0]
+	for _, t := range tasks {
+		if strings.TrimSpace(t.TagName) != "" {
+			if err := h.cmd.CreateTask(ctx, t); err != nil {
+				h.logger.Errorf("flushBatch: CreateTask tagged %s: %v", t.ID, err)
+			}
+		} else {
+			simple = append(simple, t)
+		}
+	}
+	if len(simple) > 0 {
+		if err := h.cmd.CreateTaskBatch(ctx, simple); err != nil {
+			h.logger.Errorf("flushBatch: CreateTaskBatch %d tasks: %v", len(simple), err)
+		}
+	}
+
+	for _, task := range tasks {
+		t := task
+		select {
+		case h.redisSema <- struct{}{}:
+			go func(t domain.Task) {
+				defer func() { <-h.redisSema }()
+				bgCtx, cancel := context.WithTimeout(context.Background(), goroutineTimeout)
+				defer cancel()
+				if err := h.cache.SetTask(bgCtx, t); err != nil {
+					h.logger.Warnf("flushBatch: cache task %s: %v", t.ID, err)
+				}
+				_ = h.cache.InvalidateUserLists(bgCtx, t.UserID)
+			}(t)
+		default:
+			h.logger.Warnf("redis semaphore full, skip cache for task %s", t.ID)
+		}
+	}
+}
+
+func (h *Handler) startDeleteBatchWorker() {
+	ticker := time.NewTicker(deleteBatchFlushMs * time.Millisecond)
+	defer ticker.Stop()
+	batch := make([]deleteItem, 0, deleteBatchMaxSize)
+
+	for {
+		select {
+		case item := <-h.deleteBatchCh:
+			batch = append(batch, item)
+			if len(batch) >= deleteBatchMaxSize {
+				h.flushDeleteBatch(batch)
+				batch = batch[:0]
+			}
+		case <-ticker.C:
+			if len(batch) > 0 {
+				h.flushDeleteBatch(batch)
+				batch = batch[:0]
+			}
+		}
+	}
+}
+
+func (h *Handler) flushDeleteBatch(items []deleteItem) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	ids := make([]string, len(items))
+	for i, item := range items {
+		ids[i] = item.id
+	}
+	if err := h.cmd.DeleteTaskBatch(ctx, ids); err != nil {
+		h.logger.Errorf("flushDeleteBatch: %d tasks: %v", len(ids), err)
+	}
+
+	for _, item := range items {
+		it := item
+		select {
+		case h.redisSema <- struct{}{}:
+			go func(id, userID string) {
+				defer func() { <-h.redisSema }()
+				bgCtx, cancel := context.WithTimeout(context.Background(), goroutineTimeout)
+				defer cancel()
+				_ = h.cache.DeleteCachedTask(bgCtx, id)
+				if userID != "" {
+					_ = h.cache.InvalidateUserLists(bgCtx, userID)
+				}
+			}(it.id, it.userID)
+		default:
+			h.logger.Warnf("redis semaphore full, skip cache delete for task %s", it.id)
+		}
+	}
+}
+
+// --- HTTP Handlers ---
+
 func (h *Handler) Register(router *httprouter.Router) {
-	router.HandlerFunc(http.MethodPost, tasksByUserURL, signature.Middleware(apperror.Middleware(h.Create)))
-	router.HandlerFunc(http.MethodPatch, taskURL, signature.Middleware(apperror.Middleware(h.Update)))
+	router.HandlerFunc(http.MethodPost, tasksByUserURL, resilience.WriteMiddleware(apperror.Middleware(h.Create)))
+	router.HandlerFunc(http.MethodPatch, taskURL, signature.Middleware(resilience.WriteMiddleware(apperror.Middleware(h.Update))))
 	router.HandlerFunc(http.MethodGet, taskURL, signature.Middleware(resilience.Middleware(apperror.Middleware(h.FindOne))))
 	router.HandlerFunc(http.MethodGet, tasksByUserURL, signature.Middleware(resilience.Middleware(filter.Middleware(sort2.MiddleWare(apperror.Middleware(h.GetList), "due_date", sort2.ASC)))))
 	router.HandlerFunc(http.MethodDelete, taskURL, signature.Middleware(apperror.Middleware(h.Delete)))
-	router.HandlerFunc(
-		http.MethodGet, tasksByTags, signature.Middleware(resilience.Middleware(filter.Middleware(sort2.MiddleWare(apperror.Middleware(h.GetListByTag), "due_date", sort2.ASC)))))
+	router.HandlerFunc(http.MethodGet, tasksByTags, signature.Middleware(resilience.Middleware(filter.Middleware(sort2.MiddleWare(apperror.Middleware(h.GetListByTag), "due_date", sort2.ASC)))))
 }
+
 func (h *Handler) Create(w http.ResponseWriter, r *http.Request) error {
-	h.logger.Info("🚀 Handler.Create START")
-	startTotal := time.Now()
-	defer func() {
-		h.logger.Infof("✅ Handler.Create TOTAL: %v", time.Since(startTotal))
-	}()
-
-	// 1. Извлечение параметров
-	paramStart := time.Now()
 	params := httprouter.ParamsFromContext(r.Context())
-	userId := params.ByName("userId")
-	paramTime := time.Since(paramStart)
-	h.logger.Infof("⏱️  Params extraction: %v", paramTime)
-
-	if userId == "" {
-		h.logger.Error("❌ Invalid user ID")
+	userID := params.ByName("userId")
+	if userID == "" {
 		http.Error(w, "Invalid user ID", http.StatusBadRequest)
 		return nil
 	}
 
-	// 2. Чтение тела запроса
-	bodyReadStart := time.Now()
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		h.logger.Errorf("❌ Failed to read body: %v", err)
 		http.Error(w, "Failed to read request body", http.StatusInternalServerError)
 		return err
 	}
 	defer r.Body.Close()
-	bodyReadTime := time.Since(bodyReadStart)
-	h.logger.Infof("⏱️  Body read: %v, size: %d bytes", bodyReadTime, len(body))
 
-	// 3. Парсинг JSON
-	parseStart := time.Now()
-	var dto model2.TaskCreateDTO
-	if err := dto.UnmarshalJSON(body); err != nil {
-		h.logger.Errorf("❌ Invalid JSON: %v", err)
+	var req dto.CreateTaskRequest
+	if err := req.UnmarshalJSON(body); err != nil {
 		http.Error(w, "Invalid request payload", http.StatusBadRequest)
-		return err
-	}
-	parseTime := time.Since(parseStart)
-	h.logger.Infof("⏱️  JSON parsed: %v", parseTime)
-
-	// 4. Создание объекта Task
-	taskCreateStart := time.Now()
-	task := model2.Task{
-		Id:          uuid.New().String(),
-		Title:       dto.Title,
-		Description: dto.Description,
-		Priory:      dto.Priory,
-		Status:      dto.Status,
-		DueDate:     dto.DueDate,
-		UserID:      userId,
-		TagsName:    dto.TagName,
-	}
-	if dto.TagID != nil && *dto.TagID != "" {
-		task.TagID = dto.TagID
-	}
-	taskCreateTime := time.Since(taskCreateStart)
-	h.logger.Infof("⏱️  Task object created: %v", taskCreateTime)
-	h.logger.Infof("📝 Task created: ID=%s, User=%s, HasTag=%v",
-		task.Id, task.UserID, task.TagID != nil)
-
-	// 5. Вызов сервиса
-	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
-	defer cancel()
-
-	serviceStart := time.Now()
-	err = h.service.CreateTaskRedis(ctx, task)
-	serviceTime := time.Since(serviceStart)
-	h.logger.Infof("⏱️  Service.CreateTask total: %v", serviceTime)
-
-	if err != nil {
-		h.logger.Errorf("❌ Service error: %v", err)
-		http.Error(w, "Failed to save task", http.StatusInternalServerError)
-		return err
+		return nil
 	}
 
-	// 6. Запись ответа
-	responseStart := time.Now()
-	w.WriteHeader(http.StatusCreated)
-	n, err := w.Write([]byte(fmt.Sprintf("Task created with ID: %s", task.Id)))
-	responseTime := time.Since(responseStart)
-	if err != nil {
-		h.logger.Errorf("❌ Failed to write response: %v, bytesWritten=%d", err, n)
-	} else {
-		h.logger.Infof("✅ Response written successfully, bytes: %d, duration: %v", n, responseTime)
-	}
+	task := dtoToEntity(userID, req)
 
-	go func(task model2.Task) {
-		ctxPostgres, cancelPostgres := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancelPostgres()
-		var postgresErr error
-		postgresErr = h.service.CreateTask(ctxPostgres, task)
-		if postgresErr != nil {
-			h.logger.Info(postgresErr)
+	select {
+	case h.batchCh <- task:
+		w.WriteHeader(http.StatusAccepted)
+		w.Write([]byte(fmt.Sprintf("Task accepted with ID: %s", task.ID)))
+	default:
+		h.logger.Warnf("batch channel full, fallback to sync for task %s", task.ID)
+		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+		defer cancel()
+		if err := h.cmd.CreateTask(ctx, task); err != nil {
+			h.logger.Errorf("Create: sync fallback %s: %v", task.ID, err)
+			http.Error(w, "Failed to save task", http.StatusInternalServerError)
+			return nil
 		}
-	}(task)
+		w.WriteHeader(http.StatusCreated)
+		w.Write([]byte(fmt.Sprintf("Task created with ID: %s", task.ID)))
+	}
 	return nil
 }
 
 func (h *Handler) Update(w http.ResponseWriter, r *http.Request) error {
-	h.logger.Info("UpdateTask called")
-
 	params := httprouter.ParamsFromContext(r.Context())
 	id := params.ByName("uuid")
 	if id == "" {
@@ -161,34 +307,43 @@ func (h *Handler) Update(w http.ResponseWriter, r *http.Request) error {
 		return errors.New("invalid ID")
 	}
 
-	var dto model2.TaskUpdateDTO
-	if err := json.NewDecoder(r.Body).Decode(&dto); err != nil {
+	var req dto.UpdateTaskRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.logger.Errorf("Update: decode body for task %s: %v", id, err)
 		http.Error(w, "Invalid input", http.StatusBadRequest)
-		return err
+		return nil
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), 500*time.Millisecond)
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 
-	task, err := h.service.UpdateTask(ctx, id, dto)
+	patch := updateRequestToPatch(req)
+	task, err := h.cmd.UpdateTask(ctx, id, patch)
 	if err != nil {
+		h.logger.Errorf("Update: service UpdateTask %s: %v", id, err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return err
+		return nil
 	}
 
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]string{"message": "successful update"})
 
-	go func(t model2.Task) {
-		_ = h.service.UpdateTaskRedis(context.Background(), t)
-	}(task)
-
+	select {
+	case h.redisSema <- struct{}{}:
+		go func(t domain.Task) {
+			defer func() { <-h.redisSema }()
+			bgCtx, cancel := context.WithTimeout(context.Background(), goroutineTimeout)
+			defer cancel()
+			_ = h.cache.SetTask(bgCtx, t)
+			_ = h.cache.InvalidateUserLists(bgCtx, t.UserID)
+		}(task)
+	default:
+		h.logger.Warnf("redis semaphore full, skip async cache update for task %s", task.ID)
+	}
 	return nil
 }
 
 func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) error {
-	h.logger.Info("DeleteTask called")
-
 	params := httprouter.ParamsFromContext(r.Context())
 	id := params.ByName("uuid")
 	if id == "" {
@@ -196,29 +351,48 @@ func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) error {
 		return nil
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), 500*time.Millisecond)
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 
-	_, err := h.service.DeleteTask(ctx, id)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return err
+	// Берём userID из кэша до удаления — нужен для инвалидации списков.
+	cachedTask, _ := h.cache.GetTask(ctx, id)
+	item := deleteItem{id: id, userID: cachedTask.UserID}
+
+	select {
+	case h.deleteBatchCh <- item:
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		w.Write([]byte(`{"message":"delete accepted"}`))
+	default:
+		h.logger.Warnf("delete batch full, fallback to sync delete for task %s", id)
+		if err := h.cmd.DeleteTask(ctx, id); err != nil {
+			h.logger.Errorf("Delete: service DeleteTask %s: %v", id, err)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return nil
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{"message": "successful delete"})
+
+		select {
+		case h.redisSema <- struct{}{}:
+			go func() {
+				defer func() { <-h.redisSema }()
+				bgCtx, cancel := context.WithTimeout(context.Background(), goroutineTimeout)
+				defer cancel()
+				_ = h.cache.DeleteCachedTask(bgCtx, id)
+				if cachedTask.UserID != "" {
+					_ = h.cache.InvalidateUserLists(bgCtx, cachedTask.UserID)
+				}
+			}()
+		default:
+			h.logger.Warnf("redis semaphore full, skip async cache delete for task %s", id)
+		}
 	}
-
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]string{"message": "successful delete"})
-
-	go func(id string) {
-		_ = h.service.DeleteTaskRedis(context.Background(), id)
-	}(id)
-
 	return nil
 }
 
 func (h *Handler) FindOne(w http.ResponseWriter, r *http.Request) error {
-	h.logger.Info("FindOne called")
-
-	// --- Извлекаем id из URL ---
 	params := httprouter.ParamsFromContext(r.Context())
 	id := params.ByName("uuid")
 	if id == "" {
@@ -226,81 +400,84 @@ func (h *Handler) FindOne(w http.ResponseWriter, r *http.Request) error {
 		return nil
 	}
 
-	// --- Контекст с таймаутом ---
-	ctx, cancel := context.WithTimeout(r.Context(), 350*time.Millisecond)
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 
-	// --- Пытаемся достать задачу ---
-	task, err := h.service.FindOneRedis(ctx, id)
-	if err != nil || task.Id == "" {
-		h.logger.Infof("Cache miss for task %s, querying DB...", id)
-		task, err = h.service.FindOneTask(ctx, id)
-		if err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				http.Error(w, "Task not found", http.StatusNotFound)
-				return nil
-			}
-			h.logger.Errorf("Failed to get task %s: %v", id, err)
-			http.Error(w, "Service unavailable", http.StatusServiceUnavailable)
-			return err
+	// cache-first: service.FindTask уже пробует кэш
+	task, err := h.query.FindTask(ctx, id)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			http.Error(w, "Task not found", http.StatusNotFound)
+			return nil
 		}
+		h.logger.Errorf("FindOne: task %s: %v", id, err)
+		http.Error(w, "Service unavailable", http.StatusServiceUnavailable)
+		return nil
 	}
 
-	// --- Успешный ответ ---
+	// Асинхронно кэшируем после DB miss (service.FindTask не кэширует сам).
+	select {
+	case h.redisSema <- struct{}{}:
+		go func(t domain.Task) {
+			defer func() { <-h.redisSema }()
+			bgCtx, cancel := context.WithTimeout(context.Background(), goroutineTimeout)
+			defer cancel()
+			if err := h.cache.SetTask(bgCtx, t); err != nil {
+				h.logger.Warnf("FindOne: cache task %s: %v", t.ID, err)
+			}
+		}(task)
+	default:
+		h.logger.Warnf("redis semaphore full, skip cache for task %s on FindOne", task.ID)
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-
-	if err := json.NewEncoder(w).Encode(translator.ToTaskResponse(task)); err != nil {
-		h.logger.Errorf("Failed to write response: %v", err)
+	if err := json.NewEncoder(w).Encode(entityToResponse(task)); err != nil {
+		h.logger.Errorf("FindOne: encode response: %v", err)
 		return err
 	}
-
-	go func(t model2.Task) {
-		if err := h.service.CreateTaskRedis(context.Background(), t); err != nil {
-			h.logger.Warnf("Failed to cache task %s in Redis: %v", t.Id, err)
-		}
-	}(task)
-
 	return nil
 }
 
 func (h *Handler) GetList(w http.ResponseWriter, r *http.Request) error {
-	h.logger.Info("GetList called")
-
 	params := httprouter.ParamsFromContext(r.Context())
-	userId := params.ByName("userId")
-	if userId == "" {
+	userID := params.ByName("userId")
+	if userID == "" {
 		http.Error(w, "Invalid user ID", http.StatusBadRequest)
 		return nil
 	}
 
-	var filterOptions filter.Option
-	if fOptions, ok := r.Context().Value(filter.OptionsContextKey).([]filter.Field); ok {
-		filterOptions.Fields = fOptions
+	var filterOpts filter.Option
+	if f, ok := r.Context().Value(filter.OptionsContextKey).([]filter.Field); ok {
+		filterOpts.Fields = f
+	}
+	var sortOpts sort2.Options
+	if s, ok := r.Context().Value(sort2.OptionsContextKey).(sort2.Options); ok {
+		sortOpts = s
 	}
 
-	var sortOptions sort2.Options
-	if sOptions, ok := r.Context().Value(sort2.OptionsContextKey).(sort2.Options); ok {
-		sortOptions = sOptions
-	}
-
-	cacheKey := CacheKey.BuildCacheKey(userId, filterOptions, sortOptions)
-
-	ctx, cancel := context.WithTimeout(r.Context(), 500*time.Millisecond)
+	cacheKey := CacheKey.BuildCacheKey(userID, filterOpts, sortOpts)
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 
-	// --- Попытка получить задачи из кэша ---
-	tasks, err := h.service.GetTasksFromCache(ctx, cacheKey)
+	tasks, err := h.cache.GetList(ctx, cacheKey)
 	if err != nil || len(tasks) == 0 {
-		// Если кэш пуст или произошла ошибка — идем в базу
-		tasks, err = h.service.FindAllTasks(ctx, sortOptions, filterOptions, userId)
+		tasks, err = h.query.FindTasksByUser(ctx, userID, sortOpts, filterOpts)
 		if err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				w.WriteHeader(http.StatusNoContent)
 				return nil
 			}
+			h.logger.Errorf("GetList: FindTasksByUser user %s: %v", userID, err)
 			http.Error(w, "Error finding tasks", http.StatusInternalServerError)
-			return err
+			return nil
+		}
+		if len(tasks) > 0 {
+			go func() {
+				bgCtx, cancel := context.WithTimeout(context.Background(), goroutineTimeout)
+				defer cancel()
+				_ = h.cache.SetList(bgCtx, cacheKey, tasks)
+			}()
 		}
 	}
 
@@ -309,63 +486,60 @@ func (h *Handler) GetList(w http.ResponseWriter, r *http.Request) error {
 		return nil
 	}
 
-	responses := make([]model2.TaskResponse, 0, len(tasks))
+	responses := make([]dto.TaskResponse, 0, len(tasks))
 	for _, t := range tasks {
-		responses = append(responses, translator.ToTaskResponse(t))
+		responses = append(responses, entityToResponse(t))
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	if err := json.NewEncoder(w).Encode(responses); err != nil {
-		h.logger.Errorf("Failed to encode response: %v", err)
+		h.logger.Errorf("GetList: encode response: %v", err)
 		return err
 	}
-
-	go func() {
-		_ = h.service.SetTasksToCache(context.Background(), cacheKey, tasks)
-	}()
-
 	return nil
 }
 
 func (h *Handler) GetListByTag(w http.ResponseWriter, r *http.Request) error {
-	h.logger.Info("GetListByTag called")
-
 	params := httprouter.ParamsFromContext(r.Context())
-	userId := params.ByName("userId")
-	tagId := params.ByName("tagsId")
-	if userId == "" || tagId == "" {
+	userID := params.ByName("userId")
+	tagID := params.ByName("tagsId")
+	if userID == "" || tagID == "" {
 		http.Error(w, "Invalid user ID or tag ID", http.StatusBadRequest)
 		return nil
 	}
 
-	var filterOptions filter.Option
-	if fOptions, ok := r.Context().Value(filter.OptionsContextKey).([]filter.Field); ok {
-		filterOptions.Fields = fOptions
+	var filterOpts filter.Option
+	if f, ok := r.Context().Value(filter.OptionsContextKey).([]filter.Field); ok {
+		filterOpts.Fields = f
+	}
+	var sortOpts sort2.Options
+	if s, ok := r.Context().Value(sort2.OptionsContextKey).(sort2.Options); ok {
+		sortOpts = s
 	}
 
-	var sortOptions sort2.Options
-	if sOptions, ok := r.Context().Value(sort2.OptionsContextKey).(sort2.Options); ok {
-		sortOptions = sOptions
-	}
-
-	cacheKey := CacheKey.BuildCacheKeyWithTag(userId, tagId, filterOptions, sortOptions)
-
-	ctx, cancel := context.WithTimeout(r.Context(), 500*time.Millisecond)
+	cacheKey := CacheKey.BuildCacheKeyWithTag(userID, tagID, filterOpts, sortOpts)
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 
-	// --- Попытка получить задачи из кэша ---
-	tasks, err := h.service.GetTasksFromCache(ctx, cacheKey)
+	tasks, err := h.cache.GetList(ctx, cacheKey)
 	if err != nil || len(tasks) == 0 {
-		// Если кэш пуст или произошла ошибка — идем в базу
-		tasks, err = h.service.FindAllByTag(ctx, userId, tagId)
+		tasks, err = h.query.FindTasksByTag(ctx, userID, tagID)
 		if err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				w.WriteHeader(http.StatusNoContent)
 				return nil
 			}
+			h.logger.Errorf("GetListByTag: user %s tag %s: %v", userID, tagID, err)
 			http.Error(w, "Error finding tasks", http.StatusInternalServerError)
-			return err
+			return nil
+		}
+		if len(tasks) > 0 {
+			go func() {
+				bgCtx, cancel := context.WithTimeout(context.Background(), goroutineTimeout)
+				defer cancel()
+				_ = h.cache.SetList(bgCtx, cacheKey, tasks)
+			}()
 		}
 	}
 
@@ -374,22 +548,16 @@ func (h *Handler) GetListByTag(w http.ResponseWriter, r *http.Request) error {
 		return nil
 	}
 
-	responses := make([]model2.TaskResponse, 0, len(tasks))
+	responses := make([]dto.TaskResponse, 0, len(tasks))
 	for _, t := range tasks {
-		responses = append(responses, translator.ToTaskResponse(t))
+		responses = append(responses, entityToResponse(t))
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	if err := json.NewEncoder(w).Encode(responses); err != nil {
-		h.logger.Errorf("Failed to encode response: %v", err)
+		h.logger.Errorf("GetListByTag: encode response: %v", err)
 		return err
 	}
-
-	go func() {
-		_ = h.service.SetTasksToCache(context.Background(), cacheKey, tasks)
-	}()
-
 	return nil
-
 }
