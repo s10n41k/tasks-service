@@ -1,7 +1,7 @@
 package tests
 
 import (
-	"TODOLIST_Tasks/app/internal/tasks/model"
+	"TODOLIST_Tasks/app/internal/tasks/dto"
 	"TODOLIST_Tasks/app/pkg/api/resilience"
 	"bytes"
 	"context"
@@ -425,7 +425,7 @@ func testGetAllTask(t *testing.T) {
 	}
 
 	// Декодируем ответ в массив задач
-	var tasks []model.TaskResponse // Используем правильную структуру для декодирования
+	var tasks []dto.TaskResponse // Используем правильную структуру для декодирования
 	if err := json.NewDecoder(resp.Body).Decode(&tasks); err != nil {
 		t.Fatalf("Ошибка парсинга ответа: %v", err)
 	}
@@ -464,7 +464,7 @@ func testGetAllTaskByTag(t *testing.T) {
 	}
 
 	// Декодируем ответ в массив задач
-	var tasks []model.TaskResponse // Используем правильную структуру для декодирования
+	var tasks []dto.TaskResponse // Используем правильную структуру для декодирования
 	if err := json.NewDecoder(resp.Body).Decode(&tasks); err != nil {
 		t.Fatalf("Ошибка парсинга ответа: %v", err)
 	}

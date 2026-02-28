@@ -100,19 +100,25 @@ func NewClient(ctx context.Context, maxAttempts int, sc config.Config) (Client, 
 		return nil, fmt.Errorf("failed to parse pg config: %w", err)
 	}
 
-	poolConfig.MaxConns = 80
-	poolConfig.MinConns = 10
+	// При 5000 RPS с транзакцией ~2ms нужно ~10 конкурентных соединений
+	// 200 — запас на пики и медленные запросы
+	poolConfig.MaxConns = 200
+	poolConfig.MinConns = 20
 	poolConfig.MaxConnLifetime = 30 * time.Minute
 	poolConfig.MaxConnLifetimeJitter = 5 * time.Minute
-	poolConfig.MaxConnIdleTime = 2 * time.Minute
-	poolConfig.HealthCheckPeriod = 30 * time.Second
+	poolConfig.MaxConnIdleTime = 5 * time.Minute
+	poolConfig.HealthCheckPeriod = 15 * time.Second
 
 	if !usePgBouncer {
 		poolConfig.ConnConfig.RuntimeParams["jit"] = "off"
 		poolConfig.ConnConfig.RuntimeParams["work_mem"] = "16MB"
 		poolConfig.ConnConfig.RuntimeParams["effective_cache_size"] = "4GB"
-		poolConfig.ConnConfig.RuntimeParams["statement_timeout"] = "10000"
-		poolConfig.ConnConfig.RuntimeParams["idle_in_transaction_session_timeout"] = "30000"
+		// statement_timeout: 5с — быстрый фейл под нагрузкой вместо зависания
+		poolConfig.ConnConfig.RuntimeParams["statement_timeout"] = "5000"
+		// lock_timeout: не ждать блокировки дольше 2с
+		poolConfig.ConnConfig.RuntimeParams["lock_timeout"] = "2000"
+		poolConfig.ConnConfig.RuntimeParams["idle_in_transaction_session_timeout"] = "10000"
+		// synchronous_commit=off даёт 5-10x прирост throughput на INSERT
 		poolConfig.ConnConfig.RuntimeParams["synchronous_commit"] = "off"
 	} else {
 		poolConfig.ConnConfig.RuntimeParams = make(map[string]string)

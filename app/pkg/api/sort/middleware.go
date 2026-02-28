@@ -23,9 +23,9 @@ func MiddleWare(h http.HandlerFunc, defaultSortFields, defaultSortOrder string) 
 		if sortOrder == "" {
 			sortOrder = defaultSortOrder
 		} else {
-			upperSortOrder := strings.ToUpper(sortOrder)
-			if upperSortOrder != ASC && upperSortOrder != DESC {
-				http.Error(w, "bad sort order", http.StatusBadRequest) // ✅ вот так
+			sortOrder = strings.ToUpper(sortOrder)
+			if sortOrder != ASC && sortOrder != DESC {
+				http.Error(w, "bad sort order", http.StatusBadRequest)
 				return
 			}
 		}

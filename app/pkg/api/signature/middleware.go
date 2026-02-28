@@ -12,30 +12,35 @@ import (
 	"time"
 )
 
+type contextKey string
+
+const (
+	CtxSignatureVerified contextKey = "signature_verified"
+	CtxUserID            contextKey = "user_id"
+	CtxSessionID         contextKey = "session_id"
+	CtxUserRoles         contextKey = "user_roles"
+)
+
 func Middleware(h http.HandlerFunc) http.HandlerFunc {
-	// Берем секрет из переменной окружения
 	secret := os.Getenv("GATEWAY_SIGN")
 	if secret == "" {
 		secret = os.Getenv("SIGN_SECRET")
 	}
 	if secret == "" {
-		panic("GATEWAY_SECRET or SIGN_SECRET environment variable is required")
+		panic("GATEWAY_SIGN or SIGN_SECRET environment variable is required")
 	}
 
 	return func(w http.ResponseWriter, r *http.Request) {
-		// Пропускаем публичные маршруты
 		if isPublicRoute(r.URL.Path) {
 			h(w, r)
 			return
 		}
 
-		// Получаем заголовки
-		signature := r.Header.Get("X-Signature")
+		sig := r.Header.Get("X-Signature")
 		timestampStr := r.Header.Get("X-Timestamp")
 		serviceName := r.Header.Get("X-Service-Name")
 
-		// Проверяем базовые требования
-		if signature == "" || timestampStr == "" {
+		if sig == "" || timestampStr == "" {
 			http.Error(w, `{"error": "Signature required"}`, http.StatusUnauthorized)
 			return
 		}
@@ -45,24 +50,20 @@ func Middleware(h http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 
-		// Проверяем timestamp
 		timestamp, err := strconv.ParseInt(timestampStr, 10, 64)
 		if err != nil {
 			http.Error(w, `{"error": "Invalid timestamp"}`, http.StatusUnauthorized)
 			return
 		}
 
-		// Проверяем свежесть запроса (5 минут)
 		if time.Since(time.Unix(timestamp, 0)) > 5*time.Minute {
 			http.Error(w, `{"error": "Request too old"}`, http.StatusUnauthorized)
 			return
 		}
 
-		// Воссоздаем подпись для проверки
 		userID := r.Header.Get("X-User-ID")
 		sessionID := r.Header.Get("X-Session-ID")
 
-		// Собираем данные как в Gateway
 		parts := []string{r.Method, r.URL.Path, timestampStr}
 		if userID != "" {
 			parts = append(parts, userID)
@@ -73,25 +74,22 @@ func Middleware(h http.HandlerFunc) http.HandlerFunc {
 
 		dataToSign := strings.Join(parts, "|")
 
-		// Создаем HMAC для проверки
 		hmacHash := hmac.New(sha256.New, []byte(secret))
 		hmacHash.Write([]byte(dataToSign))
 		expectedSignature := hex.EncodeToString(hmacHash.Sum(nil))
 
-		// Сравниваем подписи
-		if !hmac.Equal([]byte(signature), []byte(expectedSignature)) {
+		if !hmac.Equal([]byte(sig), []byte(expectedSignature)) {
 			http.Error(w, `{"error": "Invalid signature"}`, http.StatusUnauthorized)
 			return
 		}
 
-		// Добавляем информацию в контекст
 		ctx := r.Context()
-		ctx = context.WithValue(ctx, "signature_verified", true)
-		ctx = context.WithValue(ctx, "user_id", userID)
-		ctx = context.WithValue(ctx, "session_id", sessionID)
+		ctx = context.WithValue(ctx, CtxSignatureVerified, true)
+		ctx = context.WithValue(ctx, CtxUserID, userID)
+		ctx = context.WithValue(ctx, CtxSessionID, sessionID)
 
 		if roles := r.Header.Get("X-User-Roles"); roles != "" {
-			ctx = context.WithValue(ctx, "user_roles", strings.Split(roles, ","))
+			ctx = context.WithValue(ctx, CtxUserRoles, strings.Split(roles, ","))
 		}
 
 		r = r.WithContext(ctx)
@@ -99,7 +97,6 @@ func Middleware(h http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-// isPublicRoute определяет публичные маршруты
 func isPublicRoute(path string) bool {
 	publicRoutes := []string{
 		"/health",

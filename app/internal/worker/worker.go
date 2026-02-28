@@ -1,9 +1,8 @@
 package worker
 
 import (
-	"TODOLIST_Tasks/app/internal/tasks/event/kafka"
-	"TODOLIST_Tasks/app/internal/tasks/model"
-	"TODOLIST_Tasks/app/internal/tasks/storage/outbox"
+	"TODOLIST_Tasks/app/internal/tasks/port"
+	"TODOLIST_Tasks/app/internal/tasks/repository/outbox"
 	"TODOLIST_Tasks/app/pkg/logging"
 	"context"
 	"encoding/json"
@@ -12,8 +11,8 @@ import (
 )
 
 type Processor struct {
-	outboxRepo   outbox.Repository
-	kafkaRepo    kafka.Repository
+	outboxRepo   port.OutboxRepository
+	kafkaRepo    port.KafkaRepository
 	logger       logging.Logger
 	batchSize    int
 	pollInterval time.Duration
@@ -21,24 +20,22 @@ type Processor struct {
 }
 
 func NewProcessor(
-	outboxRepo outbox.Repository,
-	kafkaRepo kafka.Repository,
+	outboxRepo port.OutboxRepository,
+	kafkaRepo port.KafkaRepository,
 	logger logging.Logger,
 ) *Processor {
 	return &Processor{
 		outboxRepo:   outboxRepo,
 		kafkaRepo:    kafkaRepo,
 		logger:       logger,
-		batchSize:    100,
-		pollInterval: 10 * time.Second,
+		batchSize:    1000,
+		pollInterval: 500 * time.Millisecond,
 		maxAttempts:  5,
 	}
 }
 
-// Start запускает outbox worker
 func (p *Processor) Start(ctx context.Context) {
 	p.logger.Info("Outbox processor started")
-
 	ticker := time.NewTicker(p.pollInterval)
 	defer ticker.Stop()
 
@@ -53,55 +50,53 @@ func (p *Processor) Start(ctx context.Context) {
 	}
 }
 
-// processBatch обрабатывает пачку необработанных событий
 func (p *Processor) processBatch(ctx context.Context) {
 	events, err := p.outboxRepo.GetUnprocessedEvents(ctx, p.batchSize)
 	if err != nil {
-		p.logger.Errorf("Failed to get unprocessed events: %v", err)
+		p.logger.Errorf("get unprocessed events: %v", err)
 		return
 	}
-
 	if len(events) == 0 {
 		return
 	}
 
-	p.logger.Infof("Processing %d outbox events", len(events))
+	p.logger.Infof("processing %d outbox events", len(events))
 
+	var successIDs []string
 	for _, event := range events {
 		if err := p.processEvent(ctx, event); err != nil {
-			p.logger.Errorf("Failed to process event %s: %v", event.ID, err)
-
+			p.logger.Errorf("process event %s: %v", event.ID, err)
 			if event.Attempts < p.maxAttempts {
 				if markErr := p.outboxRepo.MarkAsFailed(ctx, event.ID, err.Error()); markErr != nil {
-					p.logger.Errorf("Failed to mark event as failed: %v", markErr)
+					p.logger.Errorf("mark failed %s: %v", event.ID, markErr)
 				}
 			} else {
-				p.logger.Warnf("Event %s exceeded max attempts (%d), skipping", event.ID, p.maxAttempts)
+				p.logger.Warnf("event %s exceeded max attempts (%d), skipping", event.ID, p.maxAttempts)
 			}
 		} else {
-			if markErr := p.outboxRepo.MarkAsProcessed(ctx, event.ID); markErr != nil {
-				p.logger.Errorf("Failed to mark event as processed: %v", markErr)
-			}
+			successIDs = append(successIDs, event.ID)
+		}
+	}
+
+	if len(successIDs) > 0 {
+		if err := p.outboxRepo.MarkBatchAsProcessed(ctx, successIDs); err != nil {
+			p.logger.Errorf("mark batch processed: %v", err)
 		}
 	}
 }
 
-// processEvent обрабатывает одно событие
-func (p *Processor) processEvent(ctx context.Context, event model.Event) error {
-	p.logger.Debugf("Processing event %s for task %s (type: %s)",
-		event.ID, event.AggregateID, event.EventType)
-
-	// Десериализуем данные задачи
-	var task model.Task
-	if err := json.Unmarshal(event.EventData, &task); err != nil {
-		return fmt.Errorf("failed to unmarshal task data: %w", err)
+func (p *Processor) processEvent(ctx context.Context, event port.OutboxEvent) error {
+	var payload outbox.TaskPayload
+	if err := json.Unmarshal(event.EventData, &payload); err != nil {
+		return fmt.Errorf("unmarshal task payload: %w", err)
 	}
 
-	// Отправляем в Kafka через твой Repository
+	task := outbox.PayloadToTask(payload)
+
 	if err := p.kafkaRepo.Write(ctx, task, event.EventType); err != nil {
-		return fmt.Errorf("failed to send to kafka: %w", err)
+		return fmt.Errorf("kafka write: %w", err)
 	}
 
-	p.logger.Infof("Successfully sent %s event for task %s to Kafka", event.EventType, task.Id)
+	p.logger.Infof("sent %s event for task %s", event.EventType, task.ID)
 	return nil
 }

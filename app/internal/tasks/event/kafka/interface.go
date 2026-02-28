@@ -1,11 +1,8 @@
 package kafka
 
 import (
-	"TODOLIST_Tasks/app/internal/tasks/model"
-	"context"
+	"TODOLIST_Tasks/app/internal/tasks/port"
 )
 
-type Repository interface {
-	Write(ctx context.Context, task model.Task, eventType string) error
-	Close() error
-}
+// Repository — алиас port.KafkaRepository для обратной совместимости импортов.
+type Repository = port.KafkaRepository

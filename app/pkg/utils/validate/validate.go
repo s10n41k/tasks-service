@@ -1,16 +1,16 @@
 package validate
 
 import (
-	"TODOLIST_Tasks/app/internal/tasks/model"
+	"TODOLIST_Tasks/app/internal/tasks/domain"
 	"time"
 )
 
-func Validate(task model.Task) model.Task {
+func Validate(task domain.Task) domain.Task {
 	switch {
 	case task.Status == "":
-		task.Status = "2"
-	case task.Priory == "":
-		task.Priory = "green"
+		task.Status = domain.StatusInProgress
+	case task.Priority == "":
+		task.Priority = "green"
 	case task.DueDate.IsZero():
 		task.DueDate = time.Now().Add(time.Hour * 24)
 	}

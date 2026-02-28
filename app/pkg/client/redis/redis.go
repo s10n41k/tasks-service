@@ -23,6 +23,7 @@ type Client interface {
 	Exists(ctx context.Context, keys ...string) *redis.IntCmd
 	SMembers(ctx context.Context, key string) *redis.StringSliceCmd
 	Pipeline() redis.Pipeliner
+	Scan(ctx context.Context, cursor uint64, match string, count int64) *redis.ScanCmd
 	Close() error
 }
 
@@ -79,9 +80,12 @@ func (c *clientWrapper) SMembers(ctx context.Context, key string) *redis.StringS
 	return c.client.SMembers(ctx, key)
 }
 
-// 🔥 ВОТ ЭТО НОВОЕ
 func (c *clientWrapper) Pipeline() redis.Pipeliner {
 	return c.client.Pipeline()
+}
+
+func (c *clientWrapper) Scan(ctx context.Context, cursor uint64, match string, count int64) *redis.ScanCmd {
+	return c.client.Scan(ctx, cursor, match, count)
 }
 
 func NewClient(ctx context.Context, maxAttempts int, sc config.Config) (Client, error) { // 🔥 ИЗМЕНИЛ ТИП ВОЗВРАТА

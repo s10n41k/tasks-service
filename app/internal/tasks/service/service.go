@@ -1,145 +1,143 @@
 package service
 
 import (
-	storage2 "TODOLIST_Tasks/app/internal/tags/storage"
-	"TODOLIST_Tasks/app/internal/tasks/model"
-	model2 "TODOLIST_Tasks/app/internal/tasks/storage/model"
-	"TODOLIST_Tasks/app/internal/tasks/storage/postgres"
-	"TODOLIST_Tasks/app/internal/tasks/storage/redis"
+	"TODOLIST_Tasks/app/internal/tasks/domain"
+	"TODOLIST_Tasks/app/internal/tasks/port"
 	"TODOLIST_Tasks/app/pkg/api/filter"
 	"TODOLIST_Tasks/app/pkg/api/sort"
 	logging2 "TODOLIST_Tasks/app/pkg/logging"
 	"context"
 	"fmt"
-	"time"
 )
 
-type Service struct {
-	RepositoryTasks postgres.Repository
-	RepositoryTags  storage2.Repository
-	RepositoryRedis redis.Repository
-	Logger          *logging2.Logger
+type taskService struct {
+	tasks  port.TaskRepository
+	cache  port.CacheRepository
+	logger *logging2.Logger
 }
 
-func NewService(repositoryTasks postgres.Repository, repositoryTags storage2.Repository, repositoryRedis redis.Repository) *Service {
-	return &Service{RepositoryTasks: repositoryTasks, RepositoryTags: repositoryTags, RepositoryRedis: repositoryRedis, Logger: logging2.GetLogger().GetLoggerWithField("service", "tasks")}
+// New создаёт сервис и возвращает три интерфейса через один объект.
+func New(tasks port.TaskRepository, cache port.CacheRepository) (TaskCommandService, TaskQueryService, TaskCacheService) {
+	s := &taskService{
+		tasks:  tasks,
+		cache:  cache,
+		logger: logging2.GetLogger().GetLoggerWithField("service", "tasks"),
+	}
+	return s, s, s
 }
 
-func (s *Service) FindOneRedis(ctx context.Context, id string) (model.Task, error) {
-	task, err := s.RepositoryRedis.GetTaskFromCache(ctx, id)
+// --- TaskCommandService ---
+
+func (s *taskService) CreateTask(ctx context.Context, task domain.Task) error {
+	if err := s.tasks.Create(ctx, task); err != nil {
+		s.logger.Errorf("CreateTask: task %s user %s: %v", task.ID, task.UserID, err)
+		return err
+	}
+	s.logger.Infof("CreateTask: task %s создана для user %s", task.ID, task.UserID)
+	return nil
+}
+
+func (s *taskService) CreateTaskBatch(ctx context.Context, tasks []domain.Task) error {
+	if err := s.tasks.CreateBatch(ctx, tasks); err != nil {
+		s.logger.Errorf("CreateTaskBatch: %v", err)
+		return err
+	}
+	s.logger.Infof("CreateTaskBatch: вставлено %d задач", len(tasks))
+	return nil
+}
+
+// UpdateTask оркестрирует обновление: валидация перехода статуса → DB → лог.
+func (s *taskService) UpdateTask(ctx context.Context, id string, patch port.UpdatePatch) (domain.Task, error) {
+	if patch.Status != nil {
+		current, err := s.tasks.FindByID(ctx, id)
+		if err != nil {
+			return domain.Task{}, fmt.Errorf("fetch task for update: %w", err)
+		}
+		if !current.CanTransitionTo(*patch.Status) {
+			return domain.Task{}, fmt.Errorf("недопустимый переход статуса: %s → %s", current.Status, *patch.Status)
+		}
+	}
+	updated, err := s.tasks.Update(ctx, id, patch)
 	if err != nil {
-		return model.Task{}, err
+		return domain.Task{}, fmt.Errorf("update task %s: %w", id, err)
+	}
+	s.logger.Infof("task %s обновлена", id)
+	return updated, nil
+}
+
+func (s *taskService) DeleteTask(ctx context.Context, id string) error {
+	if err := s.tasks.Delete(ctx, id); err != nil {
+		return fmt.Errorf("delete task %s: %w", id, err)
+	}
+	s.logger.Infof("task %s удалена", id)
+	return nil
+}
+
+func (s *taskService) DeleteTaskBatch(ctx context.Context, ids []string) error {
+	if err := s.tasks.DeleteBatch(ctx, ids); err != nil {
+		s.logger.Errorf("DeleteTaskBatch: %v", err)
+		return err
+	}
+	s.logger.Infof("DeleteTaskBatch: удалено %d задач", len(ids))
+	return nil
+}
+
+// --- TaskQueryService ---
+
+// FindTask — cache-first получение задачи.
+func (s *taskService) FindTask(ctx context.Context, id string) (domain.Task, error) {
+	cached, err := s.cache.GetTask(ctx, id)
+	if err == nil && cached.ID != "" {
+		return cached, nil
+	}
+	task, err := s.tasks.FindByID(ctx, id)
+	if err != nil {
+		s.logger.Errorf("FindTask: task %s: %v", id, err)
+		return domain.Task{}, err
 	}
 	return task, nil
 }
 
-func (s *Service) DeleteTaskRedis(ctx context.Context, id string) error {
-	err := s.RepositoryRedis.DeleteTaskCache(ctx, id)
+func (s *taskService) FindTasksByUser(ctx context.Context, userID string, sortOpts sort.Options, filterOpts filter.Option) ([]domain.Task, error) {
+	tasks, err := s.tasks.FindByUser(ctx, userID, sortOpts, filterOpts)
 	if err != nil {
-		return err
-	}
-	return nil
-}
-
-func (s *Service) UpdateTaskRedis(ctx context.Context, task model.Task) error {
-
-	err := s.RepositoryRedis.CacheTask(ctx, task)
-	if err != nil {
-		return err
-	}
-	return nil
-}
-
-// CreateTask - обратная совместимость
-func (s *Service) CreateTask(ctx context.Context, task model.Task) error {
-	err := s.RepositoryTasks.CreateTask(ctx, task)
-	if err != nil {
-		return err
-	}
-	return nil
-}
-
-func (s *Service) CreateTaskRedis(ctx context.Context, task model.Task) error {
-	s.Logger.Info("🔴 Service.CreateTaskRedis START")
-	start := time.Now()
-
-	err := s.RepositoryRedis.CacheTask(ctx, task)
-
-	if err != nil {
-		s.Logger.Errorf("❌ Redis cache error: %v", err)
-	} else {
-		s.Logger.Infof("✅ Redis cache took: %v", time.Since(start))
-	}
-
-	return err
-}
-
-func (s *Service) UpdateTask(ctx context.Context, id string, task model.TaskUpdateDTO) (model.Task, error) {
-	// Обновление в Postgres (теперь в репозитории автоматически сохраняется в outbox)
-	result, err := s.RepositoryTasks.UpdateTask(ctx, id, task)
-	if err != nil {
-		return model.Task{}, fmt.Errorf("ошибка обновления задачи: %w", err)
-	}
-
-	s.Logger.Infof("Task %s updated successfully", id)
-	return result, nil
-}
-
-func (s *Service) DeleteTask(ctx context.Context, id string) (string, error) {
-	// Удаление в Postgres (теперь в репозитории автоматически сохраняется в outbox)
-	result, err := s.RepositoryTasks.DeleteTask(ctx, id)
-	if err != nil {
-		return "", fmt.Errorf("ошибка удаления задачи: %w", err)
-	}
-
-	s.Logger.Infof("Task %s deleted successfully", id)
-	return result, nil
-}
-
-func (s *Service) FindOneTask(ctx context.Context, id string) (model.Task, error) {
-
-	task, err := s.RepositoryTasks.FindOneTask(ctx, id)
-	if err != nil {
-		return model.Task{}, err
-	}
-	return task, nil
-}
-
-func (s *Service) FindAllByTag(ctx context.Context, userId string, tagId string) ([]model.Task, error) {
-	tasks, err := s.RepositoryTasks.FindAllByTag(ctx, userId, tagId)
-	if err != nil {
-		return []model.Task{}, err
+		s.logger.Errorf("FindTasksByUser: user %s: %v", userID, err)
+		return nil, err
 	}
 	return tasks, nil
 }
 
-func (s *Service) FindAllTasks(ctx context.Context, sortOptions sort.Options, filterOptions filter.Option, userId string) ([]model.Task, error) {
-	// Проверяем существует ли пользователь
-
-	fOptions := model2.NewFilterOptions(filterOptions)
-
-	sOptions := model2.NewSortOptions(sortOptions.Fields, sortOptions.Order)
-
-	// Теперь используем переданный filterOptions
-	tasks, err := s.RepositoryTasks.FindAllTasks(ctx, sOptions, fOptions, userId)
+func (s *taskService) FindTasksByTag(ctx context.Context, userID, tagID string) ([]domain.Task, error) {
+	tasks, err := s.tasks.FindByTag(ctx, userID, tagID)
 	if err != nil {
-		return []model.Task{}, err
+		s.logger.Errorf("FindTasksByTag: user %s tag %s: %v", userID, tagID, err)
+		return nil, err
 	}
 	return tasks, nil
 }
 
-func (s *Service) GetTasksFromCache(ctx context.Context, cacheKey string) ([]model.Task, error) {
-	tasks, err := s.RepositoryRedis.GetTasksFromCacheList(ctx, cacheKey)
-	if err != nil {
-		return nil, fmt.Errorf("ошибка при получении задач из кэша: %w", err)
-	}
-	return tasks, nil
+// --- TaskCacheService ---
+
+func (s *taskService) SetTask(ctx context.Context, task domain.Task) error {
+	return s.cache.SetTask(ctx, task)
 }
 
-func (s *Service) SetTasksToCache(ctx context.Context, cacheKey string, tasks []model.Task) error {
-	err := s.RepositoryRedis.SetTasksToCacheList(ctx, cacheKey, tasks)
-	if err != nil {
-		return fmt.Errorf("ошибка при записи задач в кэш: %w", err)
-	}
-	return nil
+func (s *taskService) GetTask(ctx context.Context, id string) (domain.Task, error) {
+	return s.cache.GetTask(ctx, id)
+}
+
+func (s *taskService) DeleteCachedTask(ctx context.Context, id string) error {
+	return s.cache.DeleteTask(ctx, id)
+}
+
+func (s *taskService) GetList(ctx context.Context, key string) ([]domain.Task, error) {
+	return s.cache.GetList(ctx, key)
+}
+
+func (s *taskService) SetList(ctx context.Context, key string, tasks []domain.Task) error {
+	return s.cache.SetList(ctx, key, tasks)
+}
+
+func (s *taskService) InvalidateUserLists(ctx context.Context, userID string) error {
+	return s.cache.InvalidateUserLists(ctx, userID)
 }
