@@ -19,6 +19,7 @@ const (
 	CtxUserID            contextKey = "user_id"
 	CtxSessionID         contextKey = "session_id"
 	CtxUserRoles         contextKey = "user_roles"
+	CtxUserSubscription  contextKey = "user_subscription"
 )
 
 func Middleware(h http.HandlerFunc) http.HandlerFunc {
@@ -63,6 +64,7 @@ func Middleware(h http.HandlerFunc) http.HandlerFunc {
 
 		userID := r.Header.Get("X-User-ID")
 		sessionID := r.Header.Get("X-Session-ID")
+		userSubscription := r.Header.Get("X-User-Subscription")
 
 		parts := []string{r.Method, r.URL.Path, timestampStr}
 		if userID != "" {
@@ -70,6 +72,9 @@ func Middleware(h http.HandlerFunc) http.HandlerFunc {
 		}
 		if sessionID != "" {
 			parts = append(parts, sessionID)
+		}
+		if userSubscription != "" {
+			parts = append(parts, userSubscription)
 		}
 
 		dataToSign := strings.Join(parts, "|")
@@ -87,6 +92,7 @@ func Middleware(h http.HandlerFunc) http.HandlerFunc {
 		ctx = context.WithValue(ctx, CtxSignatureVerified, true)
 		ctx = context.WithValue(ctx, CtxUserID, userID)
 		ctx = context.WithValue(ctx, CtxSessionID, sessionID)
+		ctx = context.WithValue(ctx, CtxUserSubscription, userSubscription)
 
 		if roles := r.Header.Get("X-User-Roles"); roles != "" {
 			ctx = context.WithValue(ctx, CtxUserRoles, strings.Split(roles, ","))

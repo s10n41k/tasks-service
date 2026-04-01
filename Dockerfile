@@ -1,7 +1,12 @@
 FROM golang:1.24-alpine AS builder
+ENV GOTOOLCHAIN=local
+ENV GOPROXY=https://proxy.golang.org,direct
+ENV GONOSUMCHECK=*
+ENV GONOSUMDB=*
 WORKDIR /app
 COPY go.mod go.sum ./
 RUN go mod download
+ARG CACHEBUST=1
 COPY . .
 # Проверяем что миграции существуют
 RUN ls -la /app/app/migrations/ || echo "No migrations found"
@@ -18,15 +23,10 @@ RUN ls -la /app/migrations/
 COPY --from=builder /app/tasks-service .
 EXPOSE 8000
 CMD echo "Запускаем миграции..." && \
-    psql "postgresql://${DB_TASKS_USERNAME}:${DB_TASKS_PASSWORD}@${DB_TASKS_HOST}:${DB_TASKS_PORT}/${DB_TASKS_DATABASE}" \
-         -f /app/migrations/0001_create_enums.up.sql && \
-    psql "postgresql://${DB_TASKS_USERNAME}:${DB_TASKS_PASSWORD}@${DB_TASKS_HOST}:${DB_TASKS_PORT}/${DB_TASKS_DATABASE}" \
-         -f /app/migrations/0002_create_tags_tables.up.sql && \
-    psql "postgresql://${DB_TASKS_USERNAME}:${DB_TASKS_PASSWORD}@${DB_TASKS_HOST}:${DB_TASKS_PORT}/${DB_TASKS_DATABASE}" \
-         -f /app/migrations/0003_create_tasks_table.up.sql && \
-    psql "postgresql://${DB_TASKS_USERNAME}:${DB_TASKS_PASSWORD}@${DB_TASKS_HOST}:${DB_TASKS_PORT}/${DB_TASKS_DATABASE}" \
-         -f /app/migrations/0004_seed_default_tags.up.sql && \
-    psql "postgresql://${DB_TASKS_USERNAME}:${DB_TASKS_PASSWORD}@${DB_TASKS_HOST}:${DB_TASKS_PORT}/${DB_TASKS_DATABASE}" \
-         -f /app/migrations/0005_create_outbox_table.up.sql && \
+    DB_URL="postgresql://${DB_TASKS_USERNAME}:${DB_TASKS_PASSWORD}@${DB_TASKS_HOST}:${DB_TASKS_PORT}/${DB_TASKS_DATABASE}" && \
+    for f in $(ls /app/migrations/*.up.sql | grep -v '0008_' | sort); do \
+        echo "Применяем $f..."; \
+        psql "$DB_URL" -f "$f"; \
+    done && \
     echo "Миграции завершены, запускаем приложение..." && \
     ./tasks-service

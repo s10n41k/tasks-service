@@ -2,8 +2,10 @@ package handlers
 
 import (
 	"TODOLIST_Tasks/app/internal/apperror"
+	taskBatch "TODOLIST_Tasks/app/internal/tasks/batch"
 	"TODOLIST_Tasks/app/internal/tasks/domain"
 	"TODOLIST_Tasks/app/internal/tasks/dto"
+	"TODOLIST_Tasks/app/internal/tasks/model"
 	"TODOLIST_Tasks/app/internal/tasks/port"
 	"TODOLIST_Tasks/app/internal/tasks/service"
 	"TODOLIST_Tasks/app/pkg/api/filter"
@@ -12,6 +14,7 @@ import (
 	sort2 "TODOLIST_Tasks/app/pkg/api/sort"
 	logging2 "TODOLIST_Tasks/app/pkg/logging"
 	"TODOLIST_Tasks/app/pkg/utils/CacheKey"
+	"TODOLIST_Tasks/app/pkg/utils/validate"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -19,58 +22,75 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/julienschmidt/httprouter"
 )
 
+// syncSubscriptionRequest — тело запроса для синхронизации подписки.
+type syncSubscriptionRequest struct {
+	UserID          string     `json:"user_id"`
+	Name            string     `json:"name,omitempty"`
+	HasSubscription bool       `json:"has_subscription"`
+	ExpiresAt       *time.Time `json:"expires_at,omitempty"`
+	TelegramChatID  *int64     `json:"telegram_chat_id,omitempty"`
+}
+
 const (
-	taskURL        = "/tasks/:uuid"
-	tasksByUserURL = "/v1/users/:userId/tasks"
-	tasksByTags    = "/v1/users/:userId/tags/:tagsId/tasks"
+	tasksURL    = "/tasks"
+	taskURL     = "/tasks/:uuid"
+	tasksByTags = "/v1/users/:userId/tags/:tagsId/tasks"
+	tasksByUser = "/v1/users/:userId/tasks"
+
+	// Подзадачи обычных задач
+	taskSubtasksURL = "/v1/users/:userId/tasks/:uuid/subtasks"
+	taskSubtaskURL  = "/v1/users/:userId/tasks/:uuid/subtasks/:sid"
+
+	subURL = "/internal/subscriptions/sync"
+
+	// Admin endpoints
+	adminTasksURL = "/admin/tasks"
 
 	goroutineTimeout      = 5 * time.Second
 	redisConcurrencyLimit = 500
-
-	batchChannelSize = 10000
-	batchMaxSize     = 500
-	batchFlushMs     = 10
-
-	deleteBatchChannelSize = 10000
-	deleteBatchMaxSize     = 500
-	deleteBatchFlushMs     = 10
 )
 
-type deleteItem struct {
-	id     string
-	userID string
-}
-
 type Handler struct {
-	cmd           service.TaskCommandService
-	query         service.TaskQueryService
-	cache         service.TaskCacheService
-	logger        *logging2.Logger
-	redisSema     chan struct{}
-	batchCh       chan domain.Task
-	deleteBatchCh chan deleteItem
+	cmd        service.TaskCommandService
+	query      service.TaskQueryService
+	cache      service.TaskCacheService
+	subtaskSvc service.SubtaskService
+	adminSvc   service.TaskAdminService
+	subSvc     service.SubscriptionService
+	wsNotifier port.WsNotifier
+	batch      *taskBatch.Processor
+	logger     *logging2.Logger
+	redisSema  chan struct{}
 }
 
-func NewHandler(cmd service.TaskCommandService, query service.TaskQueryService, cache service.TaskCacheService) *Handler {
-	h := &Handler{
-		cmd:           cmd,
-		query:         query,
-		cache:         cache,
-		logger:        logging2.GetLogger().GetLoggerWithField("handler", "tasks"),
-		redisSema:     make(chan struct{}, redisConcurrencyLimit),
-		batchCh:       make(chan domain.Task, batchChannelSize),
-		deleteBatchCh: make(chan deleteItem, deleteBatchChannelSize),
+func NewHandler(
+	cmd service.TaskCommandService,
+	query service.TaskQueryService,
+	cache service.TaskCacheService,
+	subtaskSvc service.SubtaskService,
+	subSvc service.SubscriptionService,
+	adminSvc service.TaskAdminService,
+	batchProc *taskBatch.Processor,
+	wsNotifier port.WsNotifier,
+) *Handler {
+	return &Handler{
+		cmd:        cmd,
+		query:      query,
+		cache:      cache,
+		subtaskSvc: subtaskSvc,
+		adminSvc:   adminSvc,
+		subSvc:     subSvc,
+		wsNotifier: wsNotifier,
+		batch:      batchProc,
+		logger:     logging2.GetLogger().GetLoggerWithField("handler", "tasks"),
+		redisSema:  make(chan struct{}, redisConcurrencyLimit),
 	}
-	go h.startBatchWorker()
-	go h.startDeleteBatchWorker()
-	return h
 }
 
 // --- Маппинг DTO ↔ Domain ---
@@ -81,7 +101,7 @@ func dtoToEntity(userID string, req dto.CreateTaskRequest) domain.Task {
 		ID:          uuid.New().String(),
 		Title:       req.Title,
 		Description: req.Description,
-		Priority:    req.Priority,
+		Priority:    domain.NewPriory(req.Priority),
 		Status:      domain.NewStatus(req.Status),
 		DueDate:     req.DueDate,
 		UserID:      userID,
@@ -90,22 +110,37 @@ func dtoToEntity(userID string, req dto.CreateTaskRequest) domain.Task {
 	if req.TagID != nil && *req.TagID != "" {
 		task.TagID = req.TagID
 	}
+	for i, s := range req.Subtasks {
+		task.Subtasks = append(task.Subtasks, domain.Subtask{
+			Title: s.Title,
+			Order: i,
+		})
+	}
 	return task
 }
 
 // entityToResponse маппит доменную сущность в HTTP-ответ.
 func entityToResponse(t domain.Task) dto.TaskResponse {
-	return dto.TaskResponse{
+	resp := dto.TaskResponse{
 		ID:          t.ID,
 		Title:       t.Title,
 		Description: t.Description,
-		Priority:    t.Priority,
+		Priority:    string(t.Priority),
 		Status:      string(t.Status),
 		DueDate:     t.DueDate.Format("02-01-2006 15:04"),
 		CreatedAt:   t.CreatedAt.Format("02-01-2006 15:04"),
 		UserID:      t.UserID,
 		TagName:     t.TagName,
 	}
+	for _, s := range t.Subtasks {
+		resp.Subtasks = append(resp.Subtasks, dto.SubtaskResponse{
+			ID:     s.ID,
+			Title:  s.Title,
+			IsDone: s.IsDone,
+			Order:  s.Order,
+		})
+	}
+	return resp
 }
 
 // updateRequestToPatch конвертирует HTTP-патч в port.UpdatePatch с доменными типами.
@@ -127,150 +162,84 @@ func updateRequestToPatch(req dto.UpdateTaskRequest) port.UpdatePatch {
 	return patch
 }
 
-// --- Batch workers ---
+// --- Cache helpers ---
 
-func (h *Handler) startBatchWorker() {
-	ticker := time.NewTicker(batchFlushMs * time.Millisecond)
-	defer ticker.Stop()
-	batch := make([]domain.Task, 0, batchMaxSize)
-
-	for {
-		select {
-		case task := <-h.batchCh:
-			batch = append(batch, task)
-			if len(batch) >= batchMaxSize {
-				h.flushBatch(batch)
-				batch = batch[:0]
-			}
-		case <-ticker.C:
-			if len(batch) > 0 {
-				h.flushBatch(batch)
-				batch = batch[:0]
-			}
-		}
+// invalidateTaskCache синхронно инвалидирует кэш задачи и список пользователя.
+func (h *Handler) invalidateTaskCache(ctx context.Context, taskID, userID string) {
+	_ = h.cache.DeleteCachedTask(ctx, taskID)
+	if userID != "" {
+		_ = h.cache.InvalidateUserLists(ctx, userID)
 	}
 }
 
-// flushBatch сохраняет накопленные задачи в БД.
-// Задачи с TagName вставляются по одной (резолв тега через CTE),
-// остальные — одним батч-INSERT.
-func (h *Handler) flushBatch(tasks []domain.Task) {
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-
-	simple := tasks[:0:0]
-	for _, t := range tasks {
-		if strings.TrimSpace(t.TagName) != "" {
-			if err := h.cmd.CreateTask(ctx, t); err != nil {
-				h.logger.Errorf("flushBatch: CreateTask tagged %s: %v", t.ID, err)
+// invalidateTaskCacheAsync асинхронно инвалидирует кэш с учётом семафора параллелизма.
+func (h *Handler) invalidateTaskCacheAsync(taskID, userID string) {
+	select {
+	case h.redisSema <- struct{}{}:
+		go func() {
+			defer func() { <-h.redisSema }()
+			bgCtx, cancel := context.WithTimeout(context.Background(), goroutineTimeout)
+			defer cancel()
+			_ = h.cache.DeleteCachedTask(bgCtx, taskID)
+			if userID != "" {
+				_ = h.cache.InvalidateUserLists(bgCtx, userID)
 			}
-		} else {
-			simple = append(simple, t)
-		}
-	}
-	if len(simple) > 0 {
-		if err := h.cmd.CreateTaskBatch(ctx, simple); err != nil {
-			h.logger.Errorf("flushBatch: CreateTaskBatch %d tasks: %v", len(simple), err)
-		}
-	}
-
-	for _, task := range tasks {
-		t := task
-		select {
-		case h.redisSema <- struct{}{}:
-			go func(t domain.Task) {
-				defer func() { <-h.redisSema }()
-				bgCtx, cancel := context.WithTimeout(context.Background(), goroutineTimeout)
-				defer cancel()
-				if err := h.cache.SetTask(bgCtx, t); err != nil {
-					h.logger.Warnf("flushBatch: cache task %s: %v", t.ID, err)
-				}
-				_ = h.cache.InvalidateUserLists(bgCtx, t.UserID)
-			}(t)
-		default:
-			h.logger.Warnf("redis semaphore full, skip cache for task %s", t.ID)
-		}
-	}
-}
-
-func (h *Handler) startDeleteBatchWorker() {
-	ticker := time.NewTicker(deleteBatchFlushMs * time.Millisecond)
-	defer ticker.Stop()
-	batch := make([]deleteItem, 0, deleteBatchMaxSize)
-
-	for {
-		select {
-		case item := <-h.deleteBatchCh:
-			batch = append(batch, item)
-			if len(batch) >= deleteBatchMaxSize {
-				h.flushDeleteBatch(batch)
-				batch = batch[:0]
-			}
-		case <-ticker.C:
-			if len(batch) > 0 {
-				h.flushDeleteBatch(batch)
-				batch = batch[:0]
-			}
-		}
-	}
-}
-
-func (h *Handler) flushDeleteBatch(items []deleteItem) {
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-
-	ids := make([]string, len(items))
-	for i, item := range items {
-		ids[i] = item.id
-	}
-	if err := h.cmd.DeleteTaskBatch(ctx, ids); err != nil {
-		h.logger.Errorf("flushDeleteBatch: %d tasks: %v", len(ids), err)
-	}
-
-	for _, item := range items {
-		it := item
-		select {
-		case h.redisSema <- struct{}{}:
-			go func(id, userID string) {
-				defer func() { <-h.redisSema }()
-				bgCtx, cancel := context.WithTimeout(context.Background(), goroutineTimeout)
-				defer cancel()
-				_ = h.cache.DeleteCachedTask(bgCtx, id)
-				if userID != "" {
-					_ = h.cache.InvalidateUserLists(bgCtx, userID)
-				}
-			}(it.id, it.userID)
-		default:
-			h.logger.Warnf("redis semaphore full, skip cache delete for task %s", it.id)
-		}
+		}()
+	default:
+		h.logger.Warnf("redis semaphore full, skip async cache invalidation for task %s", taskID)
 	}
 }
 
 // --- HTTP Handlers ---
 
 func (h *Handler) Register(router *httprouter.Router) {
-	router.HandlerFunc(http.MethodPost, tasksByUserURL, resilience.WriteMiddleware(apperror.Middleware(h.Create)))
+	router.HandlerFunc(http.MethodPost, tasksURL, signature.Middleware(resilience.WriteMiddleware(apperror.Middleware(h.Create))))
+	router.HandlerFunc(http.MethodPost, tasksByUser, signature.Middleware(resilience.WriteMiddleware(apperror.Middleware(h.Create))))
 	router.HandlerFunc(http.MethodPatch, taskURL, signature.Middleware(resilience.WriteMiddleware(apperror.Middleware(h.Update))))
 	router.HandlerFunc(http.MethodGet, taskURL, signature.Middleware(resilience.Middleware(apperror.Middleware(h.FindOne))))
-	router.HandlerFunc(http.MethodGet, tasksByUserURL, signature.Middleware(resilience.Middleware(filter.Middleware(sort2.MiddleWare(apperror.Middleware(h.GetList), "due_date", sort2.ASC)))))
+	router.HandlerFunc(http.MethodGet, tasksURL, signature.Middleware(resilience.Middleware(filter.Middleware(sort2.MiddleWare(apperror.Middleware(h.GetList), "due_date", sort2.ASC)))))
+	router.HandlerFunc(http.MethodGet, tasksByUser, signature.Middleware(resilience.Middleware(filter.Middleware(sort2.MiddleWare(apperror.Middleware(h.GetList), "due_date", sort2.ASC)))))
 	router.HandlerFunc(http.MethodDelete, taskURL, signature.Middleware(apperror.Middleware(h.Delete)))
 	router.HandlerFunc(http.MethodGet, tasksByTags, signature.Middleware(resilience.Middleware(filter.Middleware(sort2.MiddleWare(apperror.Middleware(h.GetListByTag), "due_date", sort2.ASC)))))
+	router.HandlerFunc(http.MethodPost, subURL, signature.Middleware(apperror.Middleware(h.SyncSubscription)))
+
+	// Подзадачи обычных задач: create / toggle / update title / delete
+	router.HandlerFunc(http.MethodPost, taskSubtasksURL, signature.Middleware(apperror.Middleware(h.AddSubtask)))
+	router.HandlerFunc(http.MethodPatch, taskSubtaskURL, signature.Middleware(apperror.Middleware(h.ToggleTaskSubtask)))
+	router.HandlerFunc(http.MethodPut, taskSubtaskURL, signature.Middleware(apperror.Middleware(h.UpdateTaskSubtask)))
+	router.HandlerFunc(http.MethodDelete, taskSubtaskURL, signature.Middleware(apperror.Middleware(h.DeleteTaskSubtask)))
+
+	// Admin endpoints
+	router.HandlerFunc(http.MethodGet, adminTasksURL, signature.Middleware(apperror.Middleware(h.AdminGetAllTasks)))
+	router.HandlerFunc(http.MethodDelete, "/admin/tasks/:uuid", signature.Middleware(apperror.Middleware(h.AdminDeleteTask)))
+	router.HandlerFunc(http.MethodDelete, "/admin/shared-tasks/:uuid", signature.Middleware(apperror.Middleware(h.AdminDeleteSharedTask)))
+	router.HandlerFunc(http.MethodPatch, "/admin/tasks/:uuid/restore", signature.Middleware(apperror.Middleware(h.AdminRestoreTask)))
+	router.HandlerFunc(http.MethodPatch, "/admin/shared-tasks/:uuid/restore", signature.Middleware(apperror.Middleware(h.AdminRestoreSharedTask)))
+
+	// Подтверждение удаления задачи пользователем
+	router.HandlerFunc(http.MethodPost, "/v1/users/:userId/tasks/:uuid/acknowledge-admin-deletion",
+		signature.Middleware(apperror.Middleware(h.AcknowledgeAdminDeletion)))
+	router.HandlerFunc(http.MethodPost, "/v1/users/:userId/shared-tasks/:stid/acknowledge-admin-deletion",
+		signature.Middleware(apperror.Middleware(h.AcknowledgeAdminDeletionShared)))
 }
 
 func (h *Handler) Create(w http.ResponseWriter, r *http.Request) error {
-	params := httprouter.ParamsFromContext(r.Context())
-	userID := params.ByName("userId")
+	userID := r.Header.Get("X-User-ID")
 	if userID == "" {
-		http.Error(w, "Invalid user ID", http.StatusBadRequest)
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return nil
+	}
+	if err := validate.UUID(userID); err != nil {
+		http.Error(w, "invalid user id", http.StatusBadRequest)
 		return nil
 	}
 
+	defer r.Body.Close()
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		http.Error(w, "Failed to read request body", http.StatusInternalServerError)
 		return err
 	}
-	defer r.Body.Close()
 
 	var req dto.CreateTaskRequest
 	if err := req.UnmarshalJSON(body); err != nil {
@@ -280,11 +249,30 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) error {
 
 	task := dtoToEntity(userID, req)
 
-	select {
-	case h.batchCh <- task:
+	// Задачи с подзадачами вставляются синхронно (нельзя через batch — subtasks нужно вставить атомарно)
+	if task.HasSubtasks() {
+		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+		defer cancel()
+		if err := h.cmd.CreateTask(ctx, task); err != nil {
+			h.logger.Errorf("Create: with subtasks %s: %v", task.ID, err)
+			http.Error(w, "Failed to save task", http.StatusInternalServerError)
+			return nil
+		}
+		go func(t domain.Task) {
+			bgCtx, cancel := context.WithTimeout(context.Background(), goroutineTimeout)
+			defer cancel()
+			_ = h.cache.SetTask(bgCtx, t)
+			_ = h.cache.InvalidateUserLists(bgCtx, t.UserID)
+		}(task)
+		w.WriteHeader(http.StatusCreated)
+		w.Write([]byte(fmt.Sprintf("Task created with ID: %s", task.ID)))
+		return nil
+	}
+
+	if h.batch.EnqueueCreate(task) {
 		w.WriteHeader(http.StatusAccepted)
 		w.Write([]byte(fmt.Sprintf("Task accepted with ID: %s", task.ID)))
-	default:
+	} else {
 		h.logger.Warnf("batch channel full, fallback to sync for task %s", task.ID)
 		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 		defer cancel()
@@ -302,9 +290,9 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) error {
 func (h *Handler) Update(w http.ResponseWriter, r *http.Request) error {
 	params := httprouter.ParamsFromContext(r.Context())
 	id := params.ByName("uuid")
-	if id == "" {
+	if err := validate.UUID(id); err != nil {
 		http.Error(w, "Invalid ID", http.StatusBadRequest)
-		return errors.New("invalid ID")
+		return nil
 	}
 
 	var req dto.UpdateTaskRequest
@@ -346,7 +334,7 @@ func (h *Handler) Update(w http.ResponseWriter, r *http.Request) error {
 func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) error {
 	params := httprouter.ParamsFromContext(r.Context())
 	id := params.ByName("uuid")
-	if id == "" {
+	if err := validate.UUID(id); err != nil {
 		http.Error(w, "Invalid ID", http.StatusBadRequest)
 		return nil
 	}
@@ -356,46 +344,31 @@ func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) error {
 
 	// Берём userID из кэша до удаления — нужен для инвалидации списков.
 	cachedTask, _ := h.cache.GetTask(ctx, id)
-	item := deleteItem{id: id, userID: cachedTask.UserID}
-
-	select {
-	case h.deleteBatchCh <- item:
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusAccepted)
-		w.Write([]byte(`{"message":"delete accepted"}`))
-	default:
-		h.logger.Warnf("delete batch full, fallback to sync delete for task %s", id)
-		if err := h.cmd.DeleteTask(ctx, id); err != nil {
-			h.logger.Errorf("Delete: service DeleteTask %s: %v", id, err)
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return nil
-		}
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(map[string]string{"message": "successful delete"})
-
-		select {
-		case h.redisSema <- struct{}{}:
-			go func() {
-				defer func() { <-h.redisSema }()
-				bgCtx, cancel := context.WithTimeout(context.Background(), goroutineTimeout)
-				defer cancel()
-				_ = h.cache.DeleteCachedTask(bgCtx, id)
-				if cachedTask.UserID != "" {
-					_ = h.cache.InvalidateUserLists(bgCtx, cachedTask.UserID)
-				}
-			}()
-		default:
-			h.logger.Warnf("redis semaphore full, skip async cache delete for task %s", id)
+	userID := cachedTask.UserID
+	if userID == "" {
+		if dbTask, _, dbErr := h.query.FindTask(ctx, id); dbErr == nil {
+			userID = dbTask.UserID
 		}
 	}
+
+	if err := h.cmd.DeleteTask(ctx, id); err != nil {
+		h.logger.Errorf("Delete: service DeleteTask %s: %v", id, err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return nil
+	}
+
+	h.invalidateTaskCache(ctx, id, userID)
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{"message": "successful delete"})
 	return nil
 }
 
 func (h *Handler) FindOne(w http.ResponseWriter, r *http.Request) error {
 	params := httprouter.ParamsFromContext(r.Context())
 	id := params.ByName("uuid")
-	if id == "" {
+	if err := validate.UUID(id); err != nil {
 		http.Error(w, "Identifier is required", http.StatusBadRequest)
 		return nil
 	}
@@ -403,8 +376,7 @@ func (h *Handler) FindOne(w http.ResponseWriter, r *http.Request) error {
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 
-	// cache-first: service.FindTask уже пробует кэш
-	task, err := h.query.FindTask(ctx, id)
+	task, fromCache, err := h.query.FindTask(ctx, id)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			http.Error(w, "Task not found", http.StatusNotFound)
@@ -415,19 +387,20 @@ func (h *Handler) FindOne(w http.ResponseWriter, r *http.Request) error {
 		return nil
 	}
 
-	// Асинхронно кэшируем после DB miss (service.FindTask не кэширует сам).
-	select {
-	case h.redisSema <- struct{}{}:
-		go func(t domain.Task) {
-			defer func() { <-h.redisSema }()
-			bgCtx, cancel := context.WithTimeout(context.Background(), goroutineTimeout)
-			defer cancel()
-			if err := h.cache.SetTask(bgCtx, t); err != nil {
-				h.logger.Warnf("FindOne: cache task %s: %v", t.ID, err)
-			}
-		}(task)
-	default:
-		h.logger.Warnf("redis semaphore full, skip cache for task %s on FindOne", task.ID)
+	if !fromCache {
+		select {
+		case h.redisSema <- struct{}{}:
+			go func(t domain.Task) {
+				defer func() { <-h.redisSema }()
+				bgCtx, cancel := context.WithTimeout(context.Background(), goroutineTimeout)
+				defer cancel()
+				if err := h.cache.SetTask(bgCtx, t); err != nil {
+					h.logger.Warnf("FindOne: cache task %s: %v", t.ID, err)
+				}
+			}(task)
+		default:
+			h.logger.Warnf("redis semaphore full, skip cache for task %s on FindOne", task.ID)
+		}
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -440,10 +413,13 @@ func (h *Handler) FindOne(w http.ResponseWriter, r *http.Request) error {
 }
 
 func (h *Handler) GetList(w http.ResponseWriter, r *http.Request) error {
-	params := httprouter.ParamsFromContext(r.Context())
-	userID := params.ByName("userId")
+	userID := r.Header.Get("X-User-ID")
 	if userID == "" {
-		http.Error(w, "Invalid user ID", http.StatusBadRequest)
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return nil
+	}
+	if err := validate.UUID(userID); err != nil {
+		http.Error(w, "invalid user id", http.StatusBadRequest)
 		return nil
 	}
 
@@ -486,26 +462,197 @@ func (h *Handler) GetList(w http.ResponseWriter, r *http.Request) error {
 		return nil
 	}
 
-	responses := make([]dto.TaskResponse, 0, len(tasks))
-	for _, t := range tasks {
-		responses = append(responses, entityToResponse(t))
-	}
-
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	if err := json.NewEncoder(w).Encode(responses); err != nil {
+	if err := json.NewEncoder(w).Encode(tasks); err != nil {
 		h.logger.Errorf("GetList: encode response: %v", err)
 		return err
 	}
 	return nil
 }
 
+// SyncSubscription — внутренний эндпоинт для синхронизации данных подписки.
+func (h *Handler) SyncSubscription(w http.ResponseWriter, r *http.Request) error {
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "cannot read body", http.StatusBadRequest)
+		return nil
+	}
+	defer r.Body.Close()
+
+	var req syncSubscriptionRequest
+	if err := json.Unmarshal(body, &req); err != nil {
+		http.Error(w, "invalid request payload", http.StatusBadRequest)
+		return nil
+	}
+	if req.UserID == "" {
+		http.Error(w, "user_id is required", http.StatusBadRequest)
+		return nil
+	}
+
+	sub := port.UserSubscription{
+		UserID:          req.UserID,
+		Name:            req.Name,
+		HasSubscription: req.HasSubscription,
+		ExpiresAt:       req.ExpiresAt,
+		TelegramChatID:  req.TelegramChatID,
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	if err := h.subSvc.SyncSubscription(ctx, sub); err != nil {
+		h.logger.Errorf("SyncSubscription user %s: %v", req.UserID, err)
+		http.Error(w, "failed to sync subscription", http.StatusInternalServerError)
+		return nil
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(`{"message":"ok"}`))
+	return nil
+}
+
+// AddSubtask — POST /v1/users/:userId/tasks/:uuid/subtasks
+// Добавляет подзадачу к существующей задаче. Только владелец задачи может добавлять подзадачи.
+func (h *Handler) AddSubtask(w http.ResponseWriter, r *http.Request) error {
+	params := httprouter.ParamsFromContext(r.Context())
+	taskID := params.ByName("uuid")
+	userID := r.Header.Get("X-User-ID")
+	if err := validate.UUID(taskID); err != nil {
+		http.Error(w, "invalid task id", http.StatusBadRequest)
+		return nil
+	}
+	if err := validate.UUID(userID); err != nil {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return nil
+	}
+
+	var body struct {
+		Title string `json:"title"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Title == "" {
+		http.Error(w, "title обязателен", http.StatusBadRequest)
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	subtask, err := h.subtaskSvc.AddSubtask(ctx, taskID, userID, body.Title)
+	if err != nil {
+		h.logger.Errorf("AddSubtask task %s user %s: %v", taskID, userID, err)
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return nil
+	}
+
+	h.invalidateTaskCacheAsync(taskID, userID)
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	return json.NewEncoder(w).Encode(map[string]interface{}{
+		"id":      subtask.ID,
+		"title":   subtask.Title,
+		"is_done": subtask.IsDone,
+		"order":   subtask.Order,
+	})
+}
+
+// ToggleTaskSubtask — PATCH /v1/users/:userId/tasks/:uuid/subtasks/:sid
+// Переключает выполненность подзадачи обычной задачи.
+// Если все подзадачи выполнены — задача автоматически переходит в статус "completed".
+func (h *Handler) ToggleTaskSubtask(w http.ResponseWriter, r *http.Request) error {
+	params := httprouter.ParamsFromContext(r.Context())
+	subtaskID := params.ByName("sid")
+	userID := r.Header.Get("X-User-ID")
+	if err := validate.UUID(subtaskID); err != nil {
+		http.Error(w, "invalid subtask id", http.StatusBadRequest)
+		return nil
+	}
+	if err := validate.UUID(userID); err != nil {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	subtask, err := h.subtaskSvc.ToggleSubtaskDone(ctx, subtaskID, userID)
+	if err != nil {
+		h.logger.Errorf("ToggleTaskSubtask subtask %s user %s: %v", subtaskID, userID, err)
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return nil
+	}
+
+	h.invalidateTaskCacheAsync(subtask.TaskID, userID)
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	return json.NewEncoder(w).Encode(map[string]interface{}{
+		"id":      subtask.ID,
+		"is_done": subtask.IsDone,
+	})
+}
+
+// UpdateTaskSubtask — PUT /v1/users/:userId/tasks/:uuid/subtasks/:sid
+// Переименовывает подзадачу. Body: {"title": "..."}
+func (h *Handler) UpdateTaskSubtask(w http.ResponseWriter, r *http.Request) error {
+	params := httprouter.ParamsFromContext(r.Context())
+	subtaskID := params.ByName("sid")
+	userID := r.Header.Get("X-User-ID")
+	if userID == "" {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return nil
+	}
+
+	var body struct {
+		Title string `json:"title"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Title == "" {
+		http.Error(w, "title обязателен", http.StatusBadRequest)
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	if err := h.subtaskSvc.UpdateSubtask(ctx, subtaskID, userID, body.Title); err != nil {
+		h.logger.Errorf("UpdateTaskSubtask subtask %s user %s: %v", subtaskID, userID, err)
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return nil
+	}
+	w.WriteHeader(http.StatusNoContent)
+	return nil
+}
+
+// DeleteTaskSubtask — DELETE /v1/users/:userId/tasks/:uuid/subtasks/:sid
+func (h *Handler) DeleteTaskSubtask(w http.ResponseWriter, r *http.Request) error {
+	params := httprouter.ParamsFromContext(r.Context())
+	subtaskID := params.ByName("sid")
+	userID := r.Header.Get("X-User-ID")
+	if userID == "" {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	if err := h.subtaskSvc.DeleteSubtask(ctx, subtaskID, userID); err != nil {
+		h.logger.Errorf("DeleteTaskSubtask subtask %s user %s: %v", subtaskID, userID, err)
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return nil
+	}
+	w.WriteHeader(http.StatusNoContent)
+	return nil
+}
+
 func (h *Handler) GetListByTag(w http.ResponseWriter, r *http.Request) error {
 	params := httprouter.ParamsFromContext(r.Context())
-	userID := params.ByName("userId")
 	tagID := params.ByName("tagsId")
+	userID := r.Header.Get("X-User-ID")
 	if userID == "" || tagID == "" {
-		http.Error(w, "Invalid user ID or tag ID", http.StatusBadRequest)
+		http.Error(w, "unauthorized or missing tag ID", http.StatusUnauthorized)
 		return nil
 	}
 
@@ -548,16 +695,295 @@ func (h *Handler) GetListByTag(w http.ResponseWriter, r *http.Request) error {
 		return nil
 	}
 
-	responses := make([]dto.TaskResponse, 0, len(tasks))
-	for _, t := range tasks {
-		responses = append(responses, entityToResponse(t))
-	}
-
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	if err := json.NewEncoder(w).Encode(responses); err != nil {
+	if err := json.NewEncoder(w).Encode(tasks); err != nil {
 		h.logger.Errorf("GetListByTag: encode response: %v", err)
 		return err
 	}
 	return nil
+}
+
+// AdminDeleteTask выполняет soft-delete задачи: помечает как удалённую администратором.
+// Пользователь увидит задачу с пометкой и должен подтвердить удаление.
+func (h *Handler) AdminDeleteTask(w http.ResponseWriter, r *http.Request) error {
+	if r.Header.Get("X-User-Role") != "admin" {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return nil
+	}
+
+	params := httprouter.ParamsFromContext(r.Context())
+	id := params.ByName("uuid")
+	if id == "" {
+		http.Error(w, "task id required", http.StatusBadRequest)
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	// Получаем задачу до мягкого удаления — нужен title для WS-уведомления
+	existingTask, _, _ := h.query.FindTask(ctx, id)
+
+	// Soft-delete: помечаем задачу
+	ownerID, err := h.adminSvc.AdminSoftDelete(ctx, id)
+	if err != nil {
+		h.logger.Errorf("AdminDeleteTask soft-delete %s: %v", id, err)
+		http.Error(w, "task not found or error", http.StatusNotFound)
+		return nil
+	}
+
+	// Синхронно инвалидируем кэш ДО WS-уведомления:
+	// если фронт получит событие до сброса кэша — увидит устаревшие данные.
+	h.invalidateTaskCache(ctx, id, ownerID)
+
+	// Асинхронно уведомляем владельца через WS
+	if ownerID != "" && h.wsNotifier != nil {
+		go func() {
+			bgCtx, cancel := context.WithTimeout(context.Background(), goroutineTimeout)
+			defer cancel()
+			_ = h.wsNotifier.Notify(bgCtx, ownerID, "task_admin_deleted", map[string]string{
+				"task_id": id,
+				"title":   existingTask.Title,
+			})
+		}()
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+	return nil
+}
+
+// AdminDeleteSharedTask выполняет soft-delete совместной задачи.
+func (h *Handler) AdminDeleteSharedTask(w http.ResponseWriter, r *http.Request) error {
+	if r.Header.Get("X-User-Role") != "admin" {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return nil
+	}
+
+	params := httprouter.ParamsFromContext(r.Context())
+	id := params.ByName("uuid")
+	if id == "" {
+		http.Error(w, "shared task id required", http.StatusBadRequest)
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	proposerID, addresseeID, title, err := h.adminSvc.AdminSoftDeleteShared(ctx, id)
+	if err != nil {
+		h.logger.Errorf("AdminDeleteSharedTask soft-delete %s: %v", id, err)
+		http.Error(w, "shared task not found or error", http.StatusNotFound)
+		return nil
+	}
+
+	// Синхронно инвалидируем кэш списков обоих участников ДО WS-уведомления
+	if proposerID != "" {
+		_ = h.cache.InvalidateUserLists(ctx, proposerID)
+	}
+	if addresseeID != "" && addresseeID != proposerID {
+		_ = h.cache.InvalidateUserLists(ctx, addresseeID)
+	}
+
+	// Уведомляем обоих участников с title
+	if h.wsNotifier != nil {
+		payload := map[string]string{"shared_task_id": id, "title": title}
+		if proposerID != "" {
+			go func(uid string) {
+				bgCtx, cancel := context.WithTimeout(context.Background(), goroutineTimeout)
+				defer cancel()
+				_ = h.wsNotifier.Notify(bgCtx, uid, "shared_task_admin_deleted", payload)
+			}(proposerID)
+		}
+		if addresseeID != "" && addresseeID != proposerID {
+			go func(uid string) {
+				bgCtx, cancel := context.WithTimeout(context.Background(), goroutineTimeout)
+				defer cancel()
+				_ = h.wsNotifier.Notify(bgCtx, uid, "shared_task_admin_deleted", payload)
+			}(addresseeID)
+		}
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+	return nil
+}
+
+// AcknowledgeAdminDeletion — пользователь подтверждает удаление задачи → физически удаляем.
+func (h *Handler) AcknowledgeAdminDeletion(w http.ResponseWriter, r *http.Request) error {
+	params := httprouter.ParamsFromContext(r.Context())
+	taskID := params.ByName("uuid")
+	userID := r.Header.Get("X-User-ID")
+	if taskID == "" || userID == "" {
+		http.Error(w, "task id and user id required", http.StatusBadRequest)
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	if err := h.adminSvc.AcknowledgeAdminDeletion(ctx, taskID, userID); err != nil {
+		h.logger.Errorf("AcknowledgeAdminDeletion task %s user %s: %v", taskID, userID, err)
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return nil
+	}
+
+	// Инвалидируем кэш синхронно — иначе loadTasks сразу после ответа попадёт в старый кэш
+	h.invalidateTaskCache(ctx, taskID, userID)
+
+	w.WriteHeader(http.StatusNoContent)
+	return nil
+}
+
+// AcknowledgeAdminDeletionShared — пользователь подтверждает удаление совместной задачи.
+func (h *Handler) AcknowledgeAdminDeletionShared(w http.ResponseWriter, r *http.Request) error {
+	params := httprouter.ParamsFromContext(r.Context())
+	taskID := params.ByName("uuid")
+	userID := r.Header.Get("X-User-ID")
+	if taskID == "" || userID == "" {
+		http.Error(w, "task id and user id required", http.StatusBadRequest)
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	if err := h.adminSvc.AcknowledgeAdminDeletionShared(ctx, taskID, userID); err != nil {
+		h.logger.Errorf("AcknowledgeAdminDeletionShared task %s user %s: %v", taskID, userID, err)
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return nil
+	}
+
+	// Инвалидируем кэш синхронно
+	h.invalidateTaskCache(ctx, taskID, userID)
+
+	w.WriteHeader(http.StatusNoContent)
+	return nil
+}
+
+// AdminRestoreTask — восстанавливает задачу, удалённую администратором (admin_deleted → FALSE).
+func (h *Handler) AdminRestoreTask(w http.ResponseWriter, r *http.Request) error {
+	params := httprouter.ParamsFromContext(r.Context())
+	id := params.ByName("uuid")
+	if id == "" {
+		http.Error(w, "task id required", http.StatusBadRequest)
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	ownerID, err := h.adminSvc.AdminRestore(ctx, id)
+	if err != nil {
+		h.logger.Errorf("AdminRestoreTask %s: %v", id, err)
+		if errors.Is(err, port.ErrNotFound) {
+			http.Error(w, "задача не найдена", http.StatusNotFound)
+		} else if errors.Is(err, port.ErrDeadlineExpired) {
+			http.Error(w, "срок задачи истёк, восстановление невозможно", http.StatusUnprocessableEntity)
+		} else {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
+		return nil
+	}
+
+	// Синхронно инвалидируем кэш ДО WS-уведомления
+	h.invalidateTaskCache(ctx, id, ownerID)
+
+	// Уведомляем пользователя через WS
+	if ownerID != "" && h.wsNotifier != nil {
+		go func() {
+			bgCtx, cancel := context.WithTimeout(context.Background(), goroutineTimeout)
+			defer cancel()
+			_ = h.wsNotifier.Notify(bgCtx, ownerID, "task_admin_restored", map[string]string{"task_id": id})
+		}()
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+	return nil
+}
+
+// AdminRestoreSharedTask — восстанавливает совместную задачу, удалённую администратором.
+func (h *Handler) AdminRestoreSharedTask(w http.ResponseWriter, r *http.Request) error {
+	params := httprouter.ParamsFromContext(r.Context())
+	id := params.ByName("uuid")
+	if id == "" {
+		http.Error(w, "shared task id required", http.StatusBadRequest)
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	proposerID, addresseeID, err := h.adminSvc.AdminRestoreShared(ctx, id)
+	if err != nil {
+		h.logger.Errorf("AdminRestoreSharedTask %s: %v", id, err)
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return nil
+	}
+
+	// Синхронно инвалидируем кэш для обоих участников ДО WS-уведомления
+	if proposerID != "" {
+		_ = h.cache.InvalidateUserLists(ctx, proposerID)
+	}
+	if addresseeID != "" && addresseeID != proposerID {
+		_ = h.cache.InvalidateUserLists(ctx, addresseeID)
+	}
+
+	// Уведомляем участников через WS
+	if h.wsNotifier != nil {
+		payload := map[string]string{"shared_task_id": id}
+		if proposerID != "" {
+			go func(uid string) {
+				bgCtx, cancel := context.WithTimeout(context.Background(), goroutineTimeout)
+				defer cancel()
+				_ = h.wsNotifier.Notify(bgCtx, uid, "shared_task_admin_restored", payload)
+			}(proposerID)
+		}
+		if addresseeID != "" && addresseeID != proposerID {
+			go func(uid string) {
+				bgCtx, cancel := context.WithTimeout(context.Background(), goroutineTimeout)
+				defer cancel()
+				_ = h.wsNotifier.Notify(bgCtx, uid, "shared_task_admin_restored", payload)
+			}(addresseeID)
+		}
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+	return nil
+}
+
+// AdminGetAllTasks возвращает все задачи всех пользователей. Только для роли admin.
+// Поддерживает фильтры: from, to (ISO даты), status, priory.
+func (h *Handler) AdminGetAllTasks(w http.ResponseWriter, r *http.Request) error {
+	if r.Header.Get("X-User-Role") != "admin" {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+
+	q := r.URL.Query()
+	from := q.Get("from")
+	to := q.Get("to")
+	status := q.Get("status")
+	priory := q.Get("priory")
+
+	var tasks []model.TaskList
+	var err error
+
+	if from != "" || to != "" || status != "" || priory != "" {
+		tasks, err = h.query.AdminFindAllFiltered(ctx, from, to, status, priory)
+	} else {
+		tasks, err = h.query.AdminFindAllTasks(ctx)
+	}
+
+	if err != nil {
+		h.logger.Errorf("AdminGetAllTasks: %v", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return nil
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	return json.NewEncoder(w).Encode(tasks)
 }

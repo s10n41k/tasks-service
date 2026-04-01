@@ -2,14 +2,14 @@ package postgres
 
 import (
 	"TODOLIST_Tasks/app/internal/tasks/domain"
+	"TODOLIST_Tasks/app/internal/tasks/model"
 	"TODOLIST_Tasks/app/internal/tasks/port"
-	postgresql "TODOLIST_Tasks/app/pkg/client/postgres"
 	"TODOLIST_Tasks/app/pkg/api/filter"
 	"TODOLIST_Tasks/app/pkg/api/sort"
+	postgresql "TODOLIST_Tasks/app/pkg/client/postgres"
 	"TODOLIST_Tasks/app/pkg/logging"
 	"TODOLIST_Tasks/app/pkg/utils/operator"
 	"context"
-	"database/sql"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -17,6 +17,7 @@ import (
 
 	sq "github.com/Masterminds/squirrel"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v4"
 )
 
 type repo struct {
@@ -25,6 +26,10 @@ type repo struct {
 }
 
 func NewRepository(db postgresql.Client, logger logging.Logger) port.TaskRepository {
+	return &repo{db: db, logger: logger}
+}
+
+func NewSubtaskRepository(db postgresql.Client, logger logging.Logger) port.SubtaskRepository {
 	return &repo{db: db, logger: logger}
 }
 
@@ -155,7 +160,8 @@ func (r *repo) FindByID(ctx context.Context, id string) (domain.Task, error) {
 	const q = `
 		SELECT t.task_id, t.title, t.description, t.priory, t.status,
 		       t.due_date, t.created_at, t.user_id, t.tag_id,
-		       COALESCE(dt.name, ct.name) AS tag_name
+		       COALESCE(dt.name, ct.name) AS tag_name,
+		       t.reminder_60m_sent_at, t.reminder_15m_sent_at, t.reminder_5m_sent_at
 		FROM tasks t
 		LEFT JOIN custom_tag ct ON t.tag_id = ct.tag_id
 		LEFT JOIN default_tag dt ON t.tag_id = dt.tag_id
@@ -166,25 +172,181 @@ func (r *repo) FindByID(ctx context.Context, id string) (domain.Task, error) {
 		&m.ID, &m.Title, &m.Description, &m.Priority,
 		&m.Status, &m.DueDate, &m.CreatedAt, &m.UserID,
 		&m.TagID, &m.TagName,
+		&m.Reminder60mSentAt, &m.Reminder15mSentAt, &m.Reminder5mSentAt,
 	)
 	if err != nil {
 		r.logger.Errorf("FindByID: scan task %s: %v", id, err)
 		return domain.Task{}, err
 	}
-	return modelToEntity(m), nil
+
+	task := modelToEntity(m)
+
+	// Подгружаем подзадачи
+	subRows, err := r.db.Query(ctx, `
+		SELECT id, task_id, title, is_done, order_num
+		FROM subtasks WHERE task_id = $1 ORDER BY order_num`, id)
+	if err != nil {
+		r.logger.Errorf("FindByID: subtasks for task %s: %v", id, err)
+		return task, nil // задача без подзадач лучше чем ошибка
+	}
+	defer subRows.Close()
+
+	task.Subtasks = []domain.Subtask{}
+	for subRows.Next() {
+		var sm SubtaskModel
+		if err := subRows.Scan(&sm.ID, &sm.TaskID, &sm.Title, &sm.IsDone, &sm.Order); err != nil {
+			r.logger.Errorf("FindByID: scan subtask: %v", err)
+			continue
+		}
+		task.Subtasks = append(task.Subtasks, subtaskModelToEntity(sm))
+	}
+	return task, subRows.Err()
 }
 
-func (r *repo) FindByUser(ctx context.Context, userID string, sortOpts sort.Options, filterOpts filter.Option) ([]domain.Task, error) {
+// --- SubtaskRepository ---
+
+func (r *repo) CreateSubtasks(ctx context.Context, taskID string, subtasks []domain.Subtask) error {
+	if len(subtasks) == 0 {
+		return nil
+	}
+	// Batch INSERT: одним запросом вместо N отдельных INSERT-ов
+	query := strings.Builder{}
+	query.WriteString("INSERT INTO subtasks (task_id, title, is_done, order_num) VALUES ")
+	args := make([]interface{}, 0, len(subtasks)*3)
+	for i, s := range subtasks {
+		if i > 0 {
+			query.WriteByte(',')
+		}
+		base := i * 3
+		fmt.Fprintf(&query, "($%d::uuid, $%d, false, $%d)", base+1, base+2, base+3)
+		args = append(args, taskID, s.Title, i)
+	}
+	if _, err := r.db.Exec(ctx, query.String(), args...); err != nil {
+		return fmt.Errorf("batch insert subtasks for task %s: %w", taskID, err)
+	}
+	return nil
+}
+
+// CreateSubtask добавляет подзадачу к существующей задаче. Только владелец может добавлять подзадачи.
+func (r *repo) CreateSubtask(ctx context.Context, taskID, ownerID, title string) (domain.Subtask, error) {
+	var sm SubtaskModel
+	err := r.db.QueryRow(ctx, `
+		INSERT INTO subtasks (task_id, title, is_done, order_num)
+		SELECT $1::uuid, $2, false,
+		       COALESCE((SELECT MAX(order_num)+1 FROM subtasks WHERE task_id = $1::uuid), 0)
+		FROM tasks
+		WHERE task_id = $1::uuid AND user_id = $3::uuid
+		RETURNING id, task_id, title, is_done, order_num`,
+		taskID, title, ownerID,
+	).Scan(&sm.ID, &sm.TaskID, &sm.Title, &sm.IsDone, &sm.Order)
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			return domain.Subtask{}, fmt.Errorf("task not found or access denied")
+		}
+		return domain.Subtask{}, fmt.Errorf("create subtask for task %s: %w", taskID, err)
+	}
+	return subtaskModelToEntity(sm), nil
+}
+
+func (r *repo) FindByTask(ctx context.Context, taskID string) ([]domain.Subtask, error) {
+	rows, err := r.db.Query(ctx,
+		`SELECT id, task_id, title, is_done, order_num FROM subtasks WHERE task_id = $1 ORDER BY order_num`,
+		taskID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("find subtasks for task %s: %w", taskID, err)
+	}
+	defer rows.Close()
+
+	var result []domain.Subtask
+	for rows.Next() {
+		var sm SubtaskModel
+		if err := rows.Scan(&sm.ID, &sm.TaskID, &sm.Title, &sm.IsDone, &sm.Order); err != nil {
+			return nil, fmt.Errorf("scan subtask: %w", err)
+		}
+		result = append(result, subtaskModelToEntity(sm))
+	}
+	return result, rows.Err()
+}
+
+func (r *repo) ToggleDone(ctx context.Context, subtaskID, taskOwnerID string) (domain.Subtask, error) {
+	var sm SubtaskModel
+	err := r.db.QueryRow(ctx, `
+		UPDATE subtasks s SET is_done = NOT s.is_done
+		FROM tasks t
+		WHERE s.id = $1::uuid
+		  AND s.task_id = t.task_id
+		  AND t.user_id = $2::uuid
+		RETURNING s.id, s.task_id, s.title, s.is_done, s.order_num`,
+		subtaskID, taskOwnerID,
+	).Scan(&sm.ID, &sm.TaskID, &sm.Title, &sm.IsDone, &sm.Order)
+	if err != nil {
+		return domain.Subtask{}, fmt.Errorf("toggle subtask %s: %w", subtaskID, err)
+	}
+	return subtaskModelToEntity(sm), nil
+}
+
+func (r *repo) AreAllDone(ctx context.Context, taskID string) (bool, error) {
+	var count int
+	err := r.db.QueryRow(ctx,
+		`SELECT COUNT(*) FROM subtasks WHERE task_id = $1::uuid AND is_done = false`,
+		taskID,
+	).Scan(&count)
+	if err != nil {
+		return false, fmt.Errorf("check subtasks done for task %s: %w", taskID, err)
+	}
+	return count == 0, nil
+}
+
+func (r *repo) DeleteSubtask(ctx context.Context, subtaskID, taskOwnerID string) error {
+	tag, err := r.db.Exec(ctx, `
+		DELETE FROM subtasks s
+		USING tasks t
+		WHERE s.id = $1::uuid
+		  AND s.task_id = t.task_id
+		  AND t.user_id = $2::uuid`,
+		subtaskID, taskOwnerID,
+	)
+	if err != nil {
+		return fmt.Errorf("delete subtask %s: %w", subtaskID, err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("подзадача не найдена или нет доступа")
+	}
+	return nil
+}
+
+func (r *repo) UpdateSubtask(ctx context.Context, subtaskID, taskOwnerID, title string) error {
+	tag, err := r.db.Exec(ctx, `
+		UPDATE subtasks s SET title = $3
+		FROM tasks t
+		WHERE s.id = $1::uuid
+		  AND s.task_id = t.task_id
+		  AND t.user_id = $2::uuid`,
+		subtaskID, taskOwnerID, title,
+	)
+	if err != nil {
+		return fmt.Errorf("update subtask %s: %w", subtaskID, err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("подзадача не найдена или нет доступа")
+	}
+	return nil
+}
+
+func (r *repo) FindByUser(ctx context.Context, userID string, sortOpts sort.Options, filterOpts filter.Option) ([]model.TaskList, error) {
 	psql := sq.StatementBuilder.PlaceholderFormat(sq.Dollar)
 
 	qb := psql.
-		Select("t.task_id", "t.title", "t.description", "t.priory", "t.status",
-			"t.due_date", "t.created_at", "t.user_id", "t.tag_id",
-			"COALESCE(ct.name, dt.name) AS name").
+		Select("t.task_id", "t.title", "t.description", "t.status", "t.priory",
+			"t.due_date", "t.user_id", "t.tag_id",
+			"COALESCE(ct.name, dt.name) AS name",
+			"COALESCE(t.admin_deleted, FALSE)", "t.admin_deleted_at").
 		From("public.tasks t").
 		LeftJoin("custom_tag ct ON t.tag_id = ct.tag_id").
 		LeftJoin("default_tag dt ON t.tag_id = dt.tag_id").
-		Where(sq.Eq{"t.user_id": userID})
+		Where(sq.Eq{"t.user_id": userID}).
+		Where("NOT (COALESCE(t.admin_deleted, FALSE) AND COALESCE(t.user_ack, FALSE))")
 
 	conditions, args := buildFilterConditions(filterOpts)
 	for i, cond := range conditions {
@@ -215,13 +377,94 @@ func (r *repo) FindByUser(ctx context.Context, userID string, sortOpts sort.Opti
 	return scanTasks(rows, r.logger, userID)
 }
 
-func (r *repo) FindByTag(ctx context.Context, userID, tagID string) ([]domain.Task, error) {
+func (r *repo) FindAll(ctx context.Context) ([]model.TaskList, error) {
+	rows, err := r.db.Query(ctx, `
+		SELECT t.task_id, t.title, t.description, t.status, t.priory,
+		       t.due_date, t.user_id, t.tag_id,
+		       COALESCE(ct.name, dt.name, '') AS name,
+		       COALESCE(t.admin_deleted, FALSE),
+		       t.admin_deleted_at
+		FROM public.tasks t
+		LEFT JOIN custom_tag ct ON t.tag_id = ct.tag_id AND ct.user_id = t.user_id
+		LEFT JOIN default_tag dt ON t.tag_id = dt.tag_id
+		ORDER BY t.created_at DESC`)
+	if err != nil {
+		r.logger.Errorf("FindAll: query: %v", err)
+		return nil, fmt.Errorf("query FindAll: %w", err)
+	}
+	defer rows.Close()
+	return scanTasks(rows, r.logger, "admin")
+}
+
+// FindAllFiltered возвращает задачи с применением фильтров (для admin отчётов).
+func (r *repo) FindAllFiltered(ctx context.Context, from, to, status, priory string) ([]model.TaskList, error) {
+	var conditions []string
+	var args []interface{}
+	idx := 1
+
+	if from != "" {
+		conditions = append(conditions, fmt.Sprintf("t.created_at >= $%d", idx))
+		args = append(args, from)
+		idx++
+	}
+	if to != "" {
+		conditions = append(conditions, fmt.Sprintf("t.created_at <= $%d", idx))
+		args = append(args, to)
+		idx++
+	}
+	if status != "" {
+		// Конвертируем текстовый статус в числовой
+		statusCode := "1"
+		switch status {
+		case "in_progress":
+			statusCode = "2"
+		case "completed":
+			statusCode = "3"
+		}
+		conditions = append(conditions, fmt.Sprintf("t.status = $%d", idx))
+		args = append(args, statusCode)
+		idx++
+	}
+	if priory != "" {
+		conditions = append(conditions, fmt.Sprintf("t.priory = $%d", idx))
+		args = append(args, priory)
+		idx++
+	}
+
+	where := ""
+	if len(conditions) > 0 {
+		where = "WHERE " + strings.Join(conditions, " AND ")
+	}
+
+	q := fmt.Sprintf(`
+		SELECT t.task_id, t.title, t.description, t.status, t.priory,
+		       t.due_date, t.user_id, t.tag_id,
+		       COALESCE(ct.name, dt.name, '') AS name,
+		       COALESCE(t.admin_deleted, FALSE),
+		       t.admin_deleted_at
+		FROM public.tasks t
+		LEFT JOIN custom_tag ct ON t.tag_id = ct.tag_id AND ct.user_id = t.user_id
+		LEFT JOIN default_tag dt ON t.tag_id = dt.tag_id
+		%s
+		ORDER BY t.created_at DESC`, where)
+
+	rows, err := r.db.Query(ctx, q, args...)
+	if err != nil {
+		r.logger.Errorf("FindAllFiltered: query: %v", err)
+		return nil, fmt.Errorf("query FindAllFiltered: %w", err)
+	}
+	defer rows.Close()
+	return scanTasks(rows, r.logger, "admin-filtered")
+}
+
+func (r *repo) FindByTag(ctx context.Context, userID, tagID string) ([]model.TaskList, error) {
 	psql := sq.StatementBuilder.PlaceholderFormat(sq.Dollar)
 
 	qb := psql.
-		Select("t.task_id", "t.title", "t.description", "t.priory", "t.status",
-			"t.due_date", "t.created_at", "t.user_id", "t.tag_id",
-			"COALESCE(ct.name, dt.name) AS name").
+		Select("t.task_id", "t.title", "t.description", "t.status", "t.priory",
+			"t.due_date", "t.user_id", "t.tag_id",
+			"COALESCE(ct.name, dt.name) AS name",
+			"COALESCE(t.admin_deleted, FALSE)", "t.admin_deleted_at").
 		From("public.tasks t").
 		LeftJoin("custom_tag ct ON t.tag_id = ct.tag_id AND ct.user_id = ?", userID).
 		LeftJoin("default_tag dt ON t.tag_id = dt.tag_id").
@@ -292,9 +535,9 @@ func (r *repo) Update(ctx context.Context, id string, patch port.UpdatePatch) (d
 
 		var tagID string
 		err := tx.QueryRow(ctx, `SELECT tag_id FROM default_tag WHERE name = $1`, *patch.TagName).Scan(&tagID)
-		if err == sql.ErrNoRows {
+		if err == pgx.ErrNoRows {
 			err = tx.QueryRow(ctx, `SELECT tag_id FROM custom_tag WHERE name = $1 AND user_id = $2`, *patch.TagName, userID).Scan(&tagID)
-			if err == sql.ErrNoRows {
+			if err == pgx.ErrNoRows {
 				err = tx.QueryRow(ctx, `INSERT INTO custom_tag (name, user_id) VALUES ($1, $2) RETURNING tag_id`, *patch.TagName, userID).Scan(&tagID)
 			}
 		}
@@ -324,9 +567,13 @@ func (r *repo) Update(ctx context.Context, id string, patch port.UpdatePatch) (d
 	var m TaskModel
 	var status string
 	err = tx.QueryRow(ctx, `
-		SELECT task_id, title, description, status, priory, due_date, user_id, tag_id, created_at
-		FROM tasks WHERE task_id = $1`, id,
-	).Scan(&m.ID, &m.Title, &m.Description, &status, &m.Priority, &m.DueDate, &m.UserID, &m.TagID, &m.CreatedAt)
+		SELECT t.task_id, t.title, t.description, t.status, t.priory, t.due_date, t.user_id, t.tag_id, t.created_at,
+		       COALESCE(dt.name, ct.name) AS tags_name
+		FROM tasks t
+		LEFT JOIN custom_tag ct ON t.tag_id = ct.tag_id
+		LEFT JOIN default_tag dt ON t.tag_id = dt.tag_id
+		WHERE t.task_id = $1`, id,
+	).Scan(&m.ID, &m.Title, &m.Description, &status, &m.Priority, &m.DueDate, &m.UserID, &m.TagID, &m.CreatedAt, &m.TagName)
 	if err != nil {
 		return domain.Task{}, fmt.Errorf("fetch updated task: %w", err)
 	}
@@ -338,14 +585,16 @@ func (r *repo) Update(ctx context.Context, id string, patch port.UpdatePatch) (d
 		return domain.Task{}, fmt.Errorf("marshal task for outbox: %w", err)
 	}
 
-	outboxQ, outboxArgs, err := sq.Insert("outbox_events").
-		Columns("id", "aggregate_type", "aggregate_id", "event_type", "event_data", "created_at").
-		Values(uuid.New().String(), "task", id, "update", eventData, time.Now().UTC()).
-		PlaceholderFormat(sq.Dollar).ToSql()
-	if err != nil {
-		return domain.Task{}, fmt.Errorf("build outbox query: %w", err)
-	}
-	if _, err = tx.Exec(ctx, outboxQ, outboxArgs...); err != nil {
+	// Версия вычисляется атомарно внутри транзакции:
+	// MAX(version)+1 от предыдущих событий этого агрегата, или 0 если первое.
+	// Это гарантирует уникальность (aggregate_type, aggregate_id, event_type, version).
+	if _, err = tx.Exec(ctx, `
+		INSERT INTO outbox_events (id, aggregate_type, aggregate_id, event_type, event_data, created_at, version)
+		VALUES ($1, 'task', $2, 'update', $3, $4,
+			COALESCE((SELECT MAX(version) + 1 FROM outbox_events
+			          WHERE aggregate_type = 'task' AND aggregate_id = $2 AND event_type = 'update'), 0))`,
+		uuid.New().String(), id, string(eventData), time.Now().UTC(),
+	); err != nil {
 		return domain.Task{}, fmt.Errorf("insert outbox event: %w", err)
 	}
 
@@ -386,7 +635,7 @@ SELECT $2, 'task', task_id, 'deleted',
         'user_id',     user_id::text,
         'tag_id',      COALESCE(tag_id::text, ''),
         'tags_name',   ''
-    )::text,
+    )::jsonb,
     $3
 FROM deleted`,
 		id, outboxID, now,
@@ -439,7 +688,7 @@ SELECT gen_random_uuid(), 'task', task_id, 'deleted',
         'user_id',     user_id::text,
         'tag_id',      COALESCE(tag_id::text, ''),
         'tags_name',   ''
-    )::text,
+    )::jsonb,
     $%d
 FROM deleted`,
 		strings.Join(placeholders, ","), nowIdx,
@@ -452,6 +701,132 @@ FROM deleted`,
 	return nil
 }
 
+// AdminSoftDelete помечает задачу как удалённую администратором.
+// Возвращает user_id владельца для WS-уведомления.
+func (r *repo) AdminSoftDelete(ctx context.Context, id string) (string, error) {
+	if _, err := uuid.Parse(id); err != nil {
+		return "", fmt.Errorf("invalid uuid: %s", id)
+	}
+	var userID string
+	err := r.db.QueryRow(ctx, `
+		UPDATE tasks SET admin_deleted = TRUE, admin_deleted_at = NOW()
+		WHERE task_id = $1 AND (admin_deleted = FALSE OR admin_deleted IS NULL)
+		RETURNING user_id`, id).Scan(&userID)
+	if err != nil {
+		return "", fmt.Errorf("admin soft delete task %s: %w", id, err)
+	}
+	return userID, nil
+}
+
+// AcknowledgeAdminDeletion — пользователь подтверждает уведомление об удалении.
+// Задача не удаляется физически: admin может восстановить её в любой момент.
+// Ставим user_ack=TRUE — задача скрывается из списка пользователя.
+func (r *repo) AcknowledgeAdminDeletion(ctx context.Context, id, userID string) error {
+	if _, err := uuid.Parse(id); err != nil {
+		return fmt.Errorf("invalid uuid: %s", id)
+	}
+	if _, err := r.db.Exec(ctx,
+		`UPDATE tasks SET user_ack = TRUE WHERE task_id = $1 AND user_id = $2 AND admin_deleted = TRUE`,
+		id, userID); err != nil {
+		return fmt.Errorf("acknowledge admin deletion task %s: %w", id, err)
+	}
+	return nil
+}
+
+// AdminSoftDeleteShared помечает совместную задачу как удалённую администратором.
+// Возвращает proposerID, addresseeID и title для WS-уведомлений.
+func (r *repo) AdminSoftDeleteShared(ctx context.Context, id string) (string, string, string, error) {
+	if _, err := uuid.Parse(id); err != nil {
+		return "", "", "", fmt.Errorf("invalid uuid: %s", id)
+	}
+	var proposerID, addresseeID, title string
+	err := r.db.QueryRow(ctx, `
+		UPDATE shared_tasks SET admin_deleted = TRUE, admin_deleted_at = NOW()
+		WHERE id = $1 AND (admin_deleted = FALSE OR admin_deleted IS NULL)
+		RETURNING proposer_id, addressee_id, title`, id).Scan(&proposerID, &addresseeID, &title)
+	if err != nil {
+		return "", "", "", fmt.Errorf("admin soft delete shared task %s: %w", id, err)
+	}
+	return proposerID, addresseeID, title, nil
+}
+
+// AcknowledgeAdminDeletionShared — пользователь подтверждает уведомление об удалении совместной задачи.
+// Задача не удаляется физически: admin может восстановить её.
+func (r *repo) AcknowledgeAdminDeletionShared(ctx context.Context, id, userID string) error {
+	if _, err := uuid.Parse(id); err != nil {
+		return fmt.Errorf("invalid uuid: %s", id)
+	}
+	if _, err := r.db.Exec(ctx,
+		`UPDATE shared_tasks SET user_ack = TRUE
+		 WHERE id = $1 AND (proposer_id = $2 OR addressee_id = $2) AND admin_deleted = TRUE`,
+		id, userID); err != nil {
+		return fmt.Errorf("acknowledge admin deletion shared task %s: %w", id, err)
+	}
+	return nil
+}
+
+// AdminRestore снимает пометку admin_deleted с обычной задачи.
+// Если дедлайн истёк — возвращает ErrDeadlineExpired, задача остаётся у admin навсегда.
+func (r *repo) AdminRestore(ctx context.Context, id string) (string, error) {
+	if _, err := uuid.Parse(id); err != nil {
+		return "", fmt.Errorf("invalid uuid: %s", id)
+	}
+
+	var userID string
+	var dueDate *time.Time
+	err := r.db.QueryRow(ctx,
+		`SELECT user_id, due_date FROM tasks WHERE task_id = $1`, id,
+	).Scan(&userID, &dueDate)
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			return "", fmt.Errorf("task not found: %w", port.ErrNotFound)
+		}
+		return "", fmt.Errorf("admin restore get task %s: %w", id, err)
+	}
+
+	if dueDate != nil && dueDate.Before(time.Now().UTC()) {
+		return "", fmt.Errorf("срок задачи истёк: %w", port.ErrDeadlineExpired)
+	}
+
+	if _, err := r.db.Exec(ctx,
+		`UPDATE tasks SET admin_deleted = FALSE, admin_deleted_at = NULL, user_ack = FALSE WHERE task_id = $1`, id,
+	); err != nil {
+		return "", fmt.Errorf("admin restore task %s: %w", id, err)
+	}
+	return userID, nil
+}
+
+// AdminRestoreShared снимает пометку admin_deleted с совместной задачи.
+// Если дедлайн истёк — восстановление невозможно.
+func (r *repo) AdminRestoreShared(ctx context.Context, id string) (string, string, error) {
+	if _, err := uuid.Parse(id); err != nil {
+		return "", "", fmt.Errorf("invalid uuid: %s", id)
+	}
+
+	var proposerID, addresseeID string
+	var dueDate *time.Time
+	err := r.db.QueryRow(ctx,
+		`SELECT proposer_id, addressee_id, due_date FROM shared_tasks WHERE id = $1`, id,
+	).Scan(&proposerID, &addresseeID, &dueDate)
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			return "", "", fmt.Errorf("shared task not found: %w", port.ErrNotFound)
+		}
+		return "", "", fmt.Errorf("admin restore get shared task %s: %w", id, err)
+	}
+
+	if dueDate != nil && dueDate.Before(time.Now().UTC()) {
+		return "", "", fmt.Errorf("срок задачи истёк: %w", port.ErrDeadlineExpired)
+	}
+
+	if _, err := r.db.Exec(ctx,
+		`UPDATE shared_tasks SET admin_deleted = FALSE, admin_deleted_at = NULL, user_ack = FALSE WHERE id = $1`, id,
+	); err != nil {
+		return "", "", fmt.Errorf("admin restore shared task %s: %w", id, err)
+	}
+	return proposerID, addresseeID, nil
+}
+
 // --- внутренние хелперы ---
 
 // toTaskPayload создаёт JSON-сериализуемое представление задачи для outbox.
@@ -461,7 +836,7 @@ func toTaskPayload(t domain.Task) taskPayloadJSON {
 		ID:          t.ID,
 		Title:       t.Title,
 		Description: t.Description,
-		Priority:    t.Priority,
+		Priority:    string(t.Priority),
 		Status:      string(t.Status),
 		DueDate:     t.DueDate,
 		UserID:      t.UserID,
@@ -488,19 +863,26 @@ func scanTasks(rows interface {
 	Next() bool
 	Scan(...interface{}) error
 	Err() error
-}, logger logging.Logger, context string) ([]domain.Task, error) {
-	var tasks []domain.Task
+}, logger logging.Logger, context string) ([]model.TaskList, error) {
+	var tasks []model.TaskList
 	for rows.Next() {
-		var m TaskModel
+		var m model.TaskList
+		var statusCode int16
 		if err := rows.Scan(
-			&m.ID, &m.Title, &m.Description, &m.Priority,
-			&m.Status, &m.DueDate, &m.CreatedAt, &m.UserID,
+			&m.ID, &m.Title, &m.Description,
+			&statusCode, &m.Priory, &m.DueDate, &m.UserID,
 			&m.TagID, &m.TagName,
+			&m.AdminDeleted, &m.AdminDeletedAt,
 		); err != nil {
 			logger.Errorf("scanTasks %s: %v", context, err)
 			return nil, fmt.Errorf("scan row: %w", err)
 		}
-		tasks = append(tasks, modelToEntity(m))
+		m.Status = string(domain.NewStatus(fmt.Sprintf("%d", statusCode)))
+		// Вычисляемый статус: если дедлайн прошёл и задача не завершена → not_completed
+		if m.Status != string(domain.StatusCompleted) && !m.DueDate.IsZero() && m.DueDate.Before(time.Now()) {
+			m.Status = string(domain.StatusNotCompleted)
+		}
+		tasks = append(tasks, m)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("rows error: %w", err)

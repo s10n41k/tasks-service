@@ -5,12 +5,14 @@ import (
 	"TODOLIST_Tasks/app/internal/handlers"
 	"TODOLIST_Tasks/app/internal/tags/model"
 	service2 "TODOLIST_Tasks/app/internal/tags/service"
+	"TODOLIST_Tasks/app/internal/tasks/port"
 	logging2 "TODOLIST_Tasks/app/pkg/logging"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/jackc/pgconn"
 	"github.com/julienschmidt/httprouter"
 	"io"
 	"net/http"
@@ -25,14 +27,16 @@ const (
 )
 
 type handler struct {
-	service *service2.Service
-	logger  *logging2.Logger
+	service   *service2.Service
+	taskCache port.CacheRepository // для инвалидации кэша задач при изменении тегов
+	logger    *logging2.Logger
 }
 
-func NewHandler(service *service2.Service) handlers.Handler {
+func NewHandler(service *service2.Service, taskCache port.CacheRepository) handlers.Handler {
 	return &handler{
-		service: service,
-		logger:  logging2.GetLogger().GetLoggerWithField("handler", "tags"),
+		service:   service,
+		taskCache: taskCache,
+		logger:    logging2.GetLogger().GetLoggerWithField("handler", "tags"),
 	}
 }
 
@@ -72,6 +76,10 @@ func (h *handler) CreateTag(w http.ResponseWriter, r *http.Request) error {
 	result, err := h.service.CreateTags(ctx, tag, userId)
 	if err != nil {
 		h.logger.Errorf("failed to create tag: %v", err)
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+			return apperror.BadRequest(fmt.Sprintf("Тег «%s» уже существует", tag.Name), pgErr.Error())
+		}
 		return err
 	}
 	tag.Id = result
@@ -86,6 +94,10 @@ func (h *handler) CreateTag(w http.ResponseWriter, r *http.Request) error {
 		defer bgCancel()
 		if cacheErr := h.service.CreateTagsRedis(bgCtx, tag, userId); cacheErr != nil {
 			h.logger.Errorf("failed to cache tag in Redis: %v", cacheErr)
+		}
+		// Инвалидируем кэш списка тегов, чтобы новый тег сразу появился в GetList
+		if invErr := h.service.InvalidateTagListCache(bgCtx, userId); invErr != nil {
+			h.logger.Errorf("failed to invalidate tag list cache after create: %v", invErr)
 		}
 	}(tag, userId)
 
@@ -123,6 +135,14 @@ func (h *handler) Delete(w http.ResponseWriter, r *http.Request) error {
 		defer bgCancel()
 		if delErr := h.service.DeleteTagsRedis(bgCtx, tagId, userId); delErr != nil {
 			h.logger.Errorf("failed to delete tag %s from Redis: %v", tagId, delErr)
+		}
+		// Инвалидируем кэш списка тегов
+		if invErr := h.service.InvalidateTagListCache(bgCtx, userId); invErr != nil {
+			h.logger.Errorf("failed to invalidate tag list cache after delete: %v", invErr)
+		}
+		// Инвалидируем кэши всех задач пользователя — иначе карточка задачи покажет удалённый тег
+		if invErr := h.taskCache.InvalidateUserTaskCaches(bgCtx, userId); invErr != nil {
+			h.logger.Errorf("failed to invalidate user task caches for tag delete %s: %v", tagId, invErr)
 		}
 	}(tagId, userId)
 
@@ -285,12 +305,20 @@ func (h *handler) UpdateTag(w http.ResponseWriter, r *http.Request) error {
 	go func(tagId string, userId string, tagRequest model.TagsDTO) {
 		bgCtx, bgCancel := context.WithTimeout(context.Background(), goroutineTimeout)
 		defer bgCancel()
+		// Обновляем кэш отдельного тега
 		if delErr := h.service.DeleteTagsRedis(bgCtx, tagId, userId); delErr != nil {
 			h.logger.Errorf("failed to delete tag from Redis: %v", delErr)
-			return
 		}
 		if updErr := h.service.UpdateTagsRedis(bgCtx, tagId, tagRequest, userId); updErr != nil {
 			h.logger.Errorf("failed to update tag in Redis: %v", updErr)
+		}
+		// Инвалидируем кэш списка тегов — иначе GetList вернёт старое имя из кэша
+		if invErr := h.service.InvalidateTagListCache(bgCtx, userId); invErr != nil {
+			h.logger.Errorf("failed to invalidate tag list cache after update: %v", invErr)
+		}
+		// Инвалидируем кэши всех задач пользователя — иначе карточка задачи покажет старое имя тега
+		if invErr := h.taskCache.InvalidateUserTaskCaches(bgCtx, userId); invErr != nil {
+			h.logger.Errorf("failed to invalidate user task caches for tag update %s: %v", tagId, invErr)
 		}
 	}(tagId, userId, tagRequest)
 

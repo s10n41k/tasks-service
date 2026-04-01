@@ -2,12 +2,18 @@ package main
 
 import (
 	"TODOLIST_Tasks/app/internal/config"
+	"TODOLIST_Tasks/app/pkg/metrics"
+	taskBatch "TODOLIST_Tasks/app/internal/tasks/batch"
+	sharedHandlers "TODOLIST_Tasks/app/internal/shared_tasks/handlers"
+	sharedPostgres "TODOLIST_Tasks/app/internal/shared_tasks/repository/postgres"
+	sharedService "TODOLIST_Tasks/app/internal/shared_tasks/service"
 	tagsDB "TODOLIST_Tasks/app/internal/tags/db/postgres"
 	tagsRedis "TODOLIST_Tasks/app/internal/tags/db/redis"
 	tagsHandlers "TODOLIST_Tasks/app/internal/tags/handlers"
 	tagsService "TODOLIST_Tasks/app/internal/tags/service"
 	kafkaProducer "TODOLIST_Tasks/app/internal/tasks/event/kafka"
 	"TODOLIST_Tasks/app/internal/tasks/handlers"
+	"TODOLIST_Tasks/app/internal/tasks/notification"
 	outboxRepo "TODOLIST_Tasks/app/internal/tasks/repository/outbox"
 	postgresRepo "TODOLIST_Tasks/app/internal/tasks/repository/postgres"
 	redisRepo "TODOLIST_Tasks/app/internal/tasks/repository/redis"
@@ -76,35 +82,68 @@ func main() {
 
 	// Инициализация репозиториев
 	taskRepo := postgresRepo.NewRepository(pgClient, *logger)
+	subtaskRepo := postgresRepo.NewSubtaskRepository(pgClient, *logger)
+	subRepo := postgresRepo.NewSubscriptionRepository(pgClient, *logger)
 	cacheRepo := redisRepo.NewRepository(redisClient)
 	outbox := outboxRepo.NewRepository(pgClient)
 	kafkaRepo := kafkaProducer.NewRepository(kafkaClient)
+
+	// Репозиторий и сервис совместных задач (отдельный домен)
+	sharedRepo := sharedPostgres.New(pgClient, *logger)
 
 	// Tags (не рефакторим, оставляем как есть)
 	tagRepo := tagsDB.NewRepository(pgClient, *logger)
 	tagRedis := tagsRedis.NewRepositoryRedis(redisClient)
 
 	// Инициализация сервисов
-	cmd, query, cache := service.New(taskRepo, cacheRepo)
+	cmd, query, cache, subtaskSvc, adminSvc := service.New(taskRepo, subtaskRepo, cacheRepo)
 	tagSvc := tagsService.NewService(tagRepo, tagRedis)
 
+	// Notification client для reminder worker
+	notifyClient := notification.NewHTTPClient(cfg.Gateway.Host, cfg.Gateway.Port, cfg.GatewaySign)
+
+	// Клиент для авто-сообщений в users-service (при изменении/удалении совместных задач)
+	usersMsg := notification.NewUsersMessageClient(cfg.UsersService.Host, cfg.UsersService.Port)
+
+	// Сервис совместных задач
+	sharedSvc := sharedService.New(sharedRepo)
+
+	// SubscriptionService — сервисный слой над локальной таблицей подписок
+	subSvc := service.NewSubscriptionService(subRepo)
+
+	// WsNotifier — HTTP-клиент для WS-уведомлений через users-service
+	wsNotifier := notification.NewWsNotifier(cfg.UsersService.Host, cfg.UsersService.Port)
+
+	// Batch-процессор для задач (создание/удаление через каналы)
+	batchProc := taskBatch.New(cmd, cache, logger)
+	batchProc.Start(ctx)
+
 	// Обработчики и роутер
-	taskHandler := handlers.NewHandler(cmd, query, cache)
-	tagHandler := tagsHandlers.NewHandler(tagSvc)
+	taskHandler := handlers.NewHandler(cmd, query, cache, subtaskSvc, subSvc, adminSvc, batchProc, wsNotifier)
+	tagHandler := tagsHandlers.NewHandler(tagSvc, cacheRepo)
+	sharedHandler := sharedHandlers.New(sharedSvc, usersMsg, subSvc)
 
 	router := httprouter.New()
 	tagHandler.Register(router)
 	taskHandler.Register(router)
+	sharedHandler.Register(router)
+
+	metricsMW, metricsHandler := metrics.NewMiddleware("tasks_service")
+	router.Handler("GET", "/metrics", metricsHandler)
 
 	// Outbox worker
 	processor := worker.NewProcessor(outbox, kafkaRepo, *logger)
 	go processor.Start(ctx)
 
+	// Reminder worker
+	reminderWorker := worker.NewReminderWorker(subRepo, notifyClient, *logger)
+	go reminderWorker.Start(ctx)
+
 	logger.Info("starting application")
-	start(router, cfg, logger)
+	start(router, cfg, logger, metricsMW)
 }
 
-func start(router *httprouter.Router, cfg *config.Config, logger *logging.Logger) {
+func start(router *httprouter.Router, cfg *config.Config, logger *logging.Logger, metricsMW func(http.Handler) http.Handler) {
 	listenAddr := fmt.Sprintf("%s:%s", cfg.Listen.BindIP, cfg.Listen.Port)
 	logger.Infof("starting server on %s", listenAddr)
 
@@ -126,7 +165,7 @@ func start(router *httprouter.Router, cfg *config.Config, logger *logging.Logger
 	})
 
 	server := &http.Server{
-		Handler:           handler,
+		Handler:           metricsMW(handler),
 		ReadTimeout:       5 * time.Second,
 		ReadHeaderTimeout: 3 * time.Second,
 		WriteTimeout:      20 * time.Second,

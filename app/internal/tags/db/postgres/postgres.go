@@ -6,10 +6,10 @@ import (
 	postgresql "TODOLIST_Tasks/app/pkg/client/postgres"
 	"TODOLIST_Tasks/app/pkg/logging"
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v4"
 )
 
 type repositoryTags struct {
@@ -63,7 +63,7 @@ func (r *repositoryTags) UpdateTags(ctx context.Context, id string, tagDTO model
 		tagDTO.Name, id, userID).Scan(&existingTagId)
 
 	// Проверяем, если ошибка не равна nil и это не "нет строк" (нет дубликата — нормальный случай)
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		r.logger.Errorf("UpdateTags: check duplicate name '%s' for user %s: %v", tagDTO.Name, userID, err)
 		return err
 	}
@@ -146,7 +146,7 @@ func (r *repositoryTags) FindOneTags(ctx context.Context, id string, userID stri
 	queryDefault := `SELECT tag_id, name FROM default_tag WHERE tag_id = $1`
 	err := r.ClientPostgres1.QueryRow(ctx, queryDefault, id).Scan(&tag.Id, &tag.Name)
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
+		if errors.Is(err, pgx.ErrNoRows) {
 			queryCustom := `SELECT tag_id, name, user_id FROM custom_tag WHERE tag_id = $1 AND user_id = $2`
 			err = r.ClientPostgres1.QueryRow(ctx, queryCustom, id, userID).Scan(&tag.Id, &tag.Name, &tag.UserID)
 			if err != nil {

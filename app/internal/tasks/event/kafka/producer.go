@@ -35,7 +35,7 @@ func (p *producer) Write(ctx context.Context, task domain.Task, eventType string
 			ID:          task.ID,
 			Title:       task.Title,
 			Description: task.Description,
-			Priority:    task.Priority,
+			Priority:    string(task.Priority),
 			Status:      string(task.Status),
 			DueDate:     task.DueDate,
 			UserID:      task.UserID,

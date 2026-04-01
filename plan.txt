@@ -1,0 +1,202 @@
+User approved Claude's plan
+  ⎿  Plan saved to: ~\.claude\plans\rippling-exploring-noodle.md · /plan to edit
+     План: Совместные задачи между друзьями
+
+     Контекст
+
+     Пользователь хочет фичу: один PRO-пользователь может создать «совместную задачу» с другом, назначить подзадачи исполнителям (себе или другу),
+     предложить другу принять/отклонить. После принятия задача появляется на Dashboard обоих, каждый может отмечать свои подзадачи выполненными.
+
+     ---
+     Архитектура
+
+     Хранилище: PostgreSQL в users-service (не трогаем tasks-service)
+     Видимость: в раздел Друзья (третья вкладка) + секция на Dashboard
+     Файлы фронта: shared_tasks.js (новый) + правки в friends.js, tasks.js, index.html
+
+     ---
+     Backend — users-service
+
+     1. Миграция 0005_create_shared_tasks.up.sql
+
+     CREATE TABLE IF NOT EXISTS shared_tasks (
+         id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+         proposer_id  UUID NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+         addressee_id UUID NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+         title        TEXT NOT NULL,
+         description  TEXT NOT NULL DEFAULT '',
+         status       VARCHAR(20) NOT NULL DEFAULT 'pending',
+         created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+         updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+     );
+     CREATE TABLE IF NOT EXISTS shared_subtasks (
+         id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+         shared_task_id UUID NOT NULL REFERENCES shared_tasks(id) ON DELETE CASCADE,
+         title          TEXT NOT NULL,
+         assignee_id    UUID NOT NULL REFERENCES users(user_id),
+         is_done        BOOLEAN NOT NULL DEFAULT FALSE,
+         order_num      INT NOT NULL DEFAULT 0,
+         created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+     );
+     CREATE INDEX IF NOT EXISTS idx_st_proposer   ON shared_tasks(proposer_id);
+     CREATE INDEX IF NOT EXISTS idx_st_addressee  ON shared_tasks(addressee_id);
+     CREATE INDEX IF NOT EXISTS idx_sst_task      ON shared_subtasks(shared_task_id);
+
+     2. Dockerfile — добавить 0004 + 0005 в CMD
+
+     Текущий Dockerfile (C:\TODOLIST\Dockerfile) пропускает миграцию 0004! Добавить:
+     psql ... -f /app/migrations/0004_create_friendships.up.sql && \
+     psql ... -f /app/migrations/0005_create_shared_tasks.up.sql && \
+
+     3. Новые модели (model.go)
+
+     type SharedTask struct {
+         ID            string          `json:"id"`
+         ProposerID    string          `json:"proposer_id"`
+         AddresseeID   string          `json:"addressee_id"`
+         Title         string          `json:"title"`
+         Description   string          `json:"description"`
+         Status        string          `json:"status"` // pending|accepted|rejected
+         CreatedAt     time.Time       `json:"created_at"`
+         Subtasks      []SharedSubtask `json:"subtasks"`
+         ProposerName  string          `json:"proposer_name,omitempty"`
+         AddresseeName string          `json:"addressee_name,omitempty"`
+     }
+     type SharedSubtask struct {
+         ID           string `json:"id"`
+         SharedTaskID string `json:"shared_task_id"`
+         Title        string `json:"title"`
+         AssigneeID   string `json:"assignee_id"`
+         AssigneeName string `json:"assignee_name,omitempty"`
+         IsDone       bool   `json:"is_done"`
+         OrderNum     int    `json:"order_num"`
+     }
+     type ProposeSharedTaskDTO struct {
+         AddresseeID string       `json:"addressee_id"`
+         Title       string       `json:"title"`
+         Description string       `json:"description"`
+         Subtasks    []SubtaskDTO `json:"subtasks"`
+     }
+     type SubtaskDTO struct {
+         Title      string `json:"title"`
+         AssigneeID string `json:"assignee_id"`
+     }
+
+     4. Интерфейс репозитория (storagePostgres/storage.go)
+
+     Добавить к PostgresRepository:
+     ProposeSharedTask(ctx, proposerID, addresseeID, title, desc string, subtasks []model.SubtaskDTO) (string, error)
+     GetSharedTasks(ctx, userID string) ([]model.SharedTask, error)
+     GetSharedTaskDetail(ctx, taskID, userID string) (*model.SharedTask, error)
+     RespondSharedTask(ctx, taskID, userID, status string) error
+     ToggleSubtaskDone(ctx, subtaskID, userID string) (bool, error) // возвращает новый статус
+
+     5. Реализация (db/postgresql/postgresql.go)
+
+     ProposeSharedTask: транзакция INSERT shared_tasks + INSERT каждого subtask
+     GetSharedTasks: JOIN users для имён, WHERE (proposer_id=$1 OR addressee_id=$1), ORDER BY created_at DESC, + второй запрос для subtasks
+     GetSharedTaskDetail: то же + проверка доступа (proposer или addressee = userID)
+     RespondSharedTask: UPDATE SET status=$2 WHERE id=$1 AND addressee_id=$3 AND status='pending'
+     ToggleSubtaskDone: UPDATE SET is_done = NOT is_done WHERE id=$1 AND assignee_id=$2 RETURNING is_done
+
+     6. Сервис (service.go)
+
+     Проверки:
+     - В ProposeSharedTask: оба пользователя должны быть друзьями (AreFriends)
+     - AssigneeID каждой подзадачи должен быть proposer или addressee (иначе 400)
+
+     7. Роуты и хендлеры (hander.go)
+
+     Новые URL-константы:
+     sharedTasksURL        = "/users/:uuid/shared-tasks"
+     sharedTaskDetailURL   = "/users/:uuid/shared-tasks/:stid"
+     sharedTaskAcceptURL   = "/users/:uuid/shared-tasks/:stid/accept"
+     sharedTaskRejectURL   = "/users/:uuid/shared-tasks/:stid/reject"
+     sharedSubtaskDoneURL  = "/users/:uuid/shared-tasks/:stid/subtasks/:sid"
+     Регистрация:
+     router.HandlerFunc(GET,   sharedTasksURL,       mw(h.GetSharedTasks))
+     router.HandlerFunc(POST,  sharedTasksURL,       mw(h.ProposeSharedTask))
+     router.HandlerFunc(GET,   sharedTaskDetailURL,  mw(h.GetSharedTaskDetail))
+     router.HandlerFunc(POST,  sharedTaskAcceptURL,  mw(h.AcceptSharedTask))
+     router.HandlerFunc(POST,  sharedTaskRejectURL,  mw(h.RejectSharedTask))
+     router.HandlerFunc(PATCH, sharedSubtaskDoneURL, mw(h.ToggleSubtaskDone))
+     ⚠️ Конфликтов нет: :stid имеет статические дочерние accept, reject, subtasks — паттерн аналогичен существующему friends/:fid/accept.
+
+     ---
+     Frontend
+
+     8. shared_tasks.js (новый файл)
+
+     Функции:
+     - loadSharedTasks() — загрузить все задачи (any status)
+     - loadAcceptedSharedTasks() — для Dashboard (status=accepted)
+     - renderSharedTasksTab() — рендер третьей вкладки Друзья
+     - openProposeTaskModal(friendId, friendName) — модальное окно предложения
+       - Поля: Название, Описание (textarea), список подзадач (динамический)
+       - Кнопка "+ Подзадача" добавляет строку: [input title] [select: Я / Друг]
+       - Кнопка "Предложить другу" вместо "Сохранить"
+     - openSharedTaskDetail(task) — модаль деталей (входящие/исходящие)
+       - Кнопки Принять/Отклонить (только для addressee + status=pending)
+       - Чекбоксы подзадач (только своих)
+     - toggleSubtaskDone(taskId, subtaskId, checkbox) — PATCH запрос
+
+     9. friends.js — изменения
+
+     - Добавить третью вкладку "📋 Совместные задачи" в renderFriendsView()
+     - Добавить _friendsTab = 'shared' как третье значение
+     - В renderFriendsContent() для _friendsTab === 'shared' → renderSharedTasksTab()
+     - В friend-card добавить кнопку: <button onclick="openProposeTaskModal('${f.id}','${f.name}')">📋 Задача</button>
+     - Polling третьей вкладки: при _friendsTab === 'shared' обновлять входящие заявки
+
+     10. tasks.js — добавить секцию Совместных задач
+
+     В функции pageDashboard() после рендера личных задач добавить вызов renderSharedTasksDashboard():
+     - loadAcceptedSharedTasks() → GET /users/:uuid/shared-tasks?status=accepted
+     - Рендерить их в отдельном div ниже основного grid с другим заголовком "🤝 Совместные задачи"
+     - Каждая карточка показывает: заголовок, имя партнёра, прогресс (N/M подзадач)
+     - Кнопка "Открыть" → openSharedTaskDetail(task)
+
+     11. index.html — добавить shared_tasks.js
+
+     <script src="js/shared_tasks.js?v=12"></script>
+     (до friends.js, после profile.js; поднять версию всех скриптов с 11 до 12)
+
+     ---
+     Сборка и деплой
+
+     1. Пересоздать миграционный файл 0005 (SQL)
+     2. Обновить Dockerfile (добавить 0004 + 0005 в CMD)
+     3. Обновить Go-код (model, storage interface, postgresql impl, service, hander)
+     4. Пересобрать образ: docker-compose build users-service
+     5. Применить миграцию вручную (или через restart контейнера):
+     docker exec <postgres-users> psql -U ... -f 0005...
+     6. Рестарт users-service: docker-compose restart users-service
+     7. Обновить frontend файлы (JS) + перезапустить nginx: docker-compose restart frontend
+
+     ---
+     Файлы для изменения
+
+     ┌────────────────────────────────────────────────────────────┬───────────────────────────────────────┐
+     │                            Файл                            │               Действие                │
+     ├────────────────────────────────────────────────────────────┼───────────────────────────────────────┤
+     │ C:\TODOLIST\app\migrations\0005_create_shared_tasks.up.sql │ СОЗДАТЬ                               │
+     ├────────────────────────────────────────────────────────────┼───────────────────────────────────────┤
+     │ C:\TODOLIST\Dockerfile                                     │ ИЗМЕНИТЬ (добавить 0004+0005 в CMD)   │
+     ├────────────────────────────────────────────────────────────┼───────────────────────────────────────┤
+     │ C:\TODOLIST\app\internal\users\model\model.go              │ ИЗМЕНИТЬ (3 новых struct)             │
+     ├────────────────────────────────────────────────────────────┼───────────────────────────────────────┤
+     │ C:\TODOLIST\app\internal\users\storagePostgres\storage.go  │ ИЗМЕНИТЬ (5 методов)                  │
+     ├────────────────────────────────────────────────────────────┼───────────────────────────────────────┤
+     │ C:\TODOLIST\app\internal\users\db\postgresql\postgresql.go │ ИЗМЕНИТЬ (реализация)                 │
+     ├────────────────────────────────────────────────────────────┼───────────────────────────────────────┤
+     │ C:\TODOLIST\app\internal\users\service\service.go          │ ИЗМЕНИТЬ (сервисный слой)             │
+     ├────────────────────────────────────────────────────────────┼───────────────────────────────────────┤
+     │ C:\TODOLIST\app\internal\users\hander.go                   │ ИЗМЕНИТЬ (5 хендлеров)                │
+     ├────────────────────────────────────────────────────────────┼───────────────────────────────────────┤
+     │ C:\infra\frontend\js\shared_tasks.js                       │ СОЗДАТЬ                               │
+     ├────────────────────────────────────────────────────────────┼───────────────────────────────────────┤
+     │ C:\infra\frontend\js\friends.js                            │ ИЗМЕНИТЬ (третья вкладка)             │
+     ├────────────────────────────────────────────────────────────┼───────────────────────────────────────┤
+     │ C:\infra\frontend\js\tasks.js                              │ ИЗМЕНИТЬ (dashboard секция)           │
+     ├────────────────────────────────────────────────────────────┼───────────────────────────────────────┤
+     │ C:\infra\frontend\index.html                               │ ИЗМЕНИТЬ (подключить shared_tasks.js) │
