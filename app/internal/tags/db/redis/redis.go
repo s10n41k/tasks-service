@@ -104,6 +104,11 @@ func (r *repositoryRedis) SetTagToCacheList(ctx context.Context, cacheKey string
 	return nil
 }
 
+// DeleteTagListCache удаляет кэш всего списка тегов пользователя (ключ = userID).
+func (r *repositoryRedis) DeleteTagListCache(ctx context.Context, userID string) error {
+	return r.Client.Del(ctx, userID).Err()
+}
+
 func NewRepositoryRedis(client redis.Client) storage.RepositoryRedis {
 	return &repositoryRedis{Client: client}
 }

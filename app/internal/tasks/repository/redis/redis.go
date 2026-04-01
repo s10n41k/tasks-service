@@ -2,6 +2,7 @@ package redis
 
 import (
 	"TODOLIST_Tasks/app/internal/tasks/domain"
+	"TODOLIST_Tasks/app/internal/tasks/model"
 	"TODOLIST_Tasks/app/internal/tasks/port"
 	redisclient "TODOLIST_Tasks/app/pkg/client/redis"
 	"context"
@@ -25,24 +26,76 @@ func NewRepository(client redisclient.Client) port.CacheRepository {
 // cacheTask — внутренняя структура для JSON-сериализации в Redis.
 // Использует те же json-ключи что и старый model.Task для обратной совместимости.
 type cacheTask struct {
-	ID          string    `json:"id"`
-	Title       string    `json:"title"`
-	Description string    `json:"description"`
-	Priority    string    `json:"priory"`
-	Status      string    `json:"status"`
-	DueDate     time.Time `json:"due_date"`
-	UserID      string    `json:"user_id"`
-	TagID       *string   `json:"tag_id,omitempty"`
-	TagName     string    `json:"tags_name"`
-	CreatedAt   time.Time `json:"created_at"`
+	ID          string         `json:"id"`
+	Title       string         `json:"title"`
+	Description string         `json:"description"`
+	Priority    string         `json:"priory"`
+	Status      string         `json:"status"`
+	DueDate     time.Time      `json:"due_date"`
+	UserID      string         `json:"user_id"`
+	TagID       *string        `json:"tag_id,omitempty"`
+	TagName     string         `json:"tags_name"`
+	CreatedAt   time.Time      `json:"created_at"`
+	Subtasks    []cacheSubtask `json:"subtasks,omitempty"`
+}
+
+type cacheSubtask struct {
+	ID     string `json:"id"`
+	TaskID string `json:"task_id"`
+	Title  string `json:"title"`
+	IsDone bool   `json:"is_done"`
+	Order  int    `json:"order"`
+}
+
+type cacheListTasks struct {
+	ID             string     `json:"id"`
+	Title          string     `json:"name"`
+	Priority       string     `json:"priory"`
+	Status         string     `json:"status"`
+	DueDate        time.Time  `json:"due_date"`
+	UserID         string     `json:"user_id"`
+	TagID          *string    `json:"tag_id,omitempty"`
+	TagName        *string    `json:"tags_name"`
+	AdminDeleted   bool       `json:"admin_deleted,omitempty"`
+	AdminDeletedAt *time.Time `json:"admin_deleted_at,omitempty"`
+}
+
+func toCacheListTasks(t model.TaskList) cacheListTasks {
+	return cacheListTasks{
+		ID:             t.ID,
+		Title:          t.Title,
+		Priority:       t.Priory,
+		Status:         t.Status,
+		DueDate:        t.DueDate,
+		UserID:         t.UserID,
+		TagID:          t.TagID,
+		TagName:        t.TagName,
+		AdminDeleted:   t.AdminDeleted,
+		AdminDeletedAt: t.AdminDeletedAt,
+	}
+}
+
+func fromCacheListTasks(c cacheListTasks) model.TaskList {
+	return model.TaskList{
+		ID:             c.ID,
+		Title:          c.Title,
+		Priory:         c.Priority,
+		Status:         c.Status,
+		DueDate:        c.DueDate,
+		UserID:         c.UserID,
+		TagID:          c.TagID,
+		TagName:        c.TagName,
+		AdminDeleted:   c.AdminDeleted,
+		AdminDeletedAt: c.AdminDeletedAt,
+	}
 }
 
 func toCacheTask(t domain.Task) cacheTask {
-	return cacheTask{
+	ct := cacheTask{
 		ID:          t.ID,
 		Title:       t.Title,
 		Description: t.Description,
-		Priority:    t.Priority,
+		Priority:    string(t.Priority),
 		Status:      string(t.Status),
 		DueDate:     t.DueDate,
 		UserID:      t.UserID,
@@ -50,14 +103,24 @@ func toCacheTask(t domain.Task) cacheTask {
 		TagName:     t.TagName,
 		CreatedAt:   t.CreatedAt,
 	}
+	for _, s := range t.Subtasks {
+		ct.Subtasks = append(ct.Subtasks, cacheSubtask{
+			ID:     s.ID,
+			TaskID: s.TaskID,
+			Title:  s.Title,
+			IsDone: s.IsDone,
+			Order:  s.Order,
+		})
+	}
+	return ct
 }
 
 func fromCacheTask(c cacheTask) domain.Task {
-	return domain.Task{
+	t := domain.Task{
 		ID:          c.ID,
 		Title:       c.Title,
 		Description: c.Description,
-		Priority:    c.Priority,
+		Priority:    domain.Priory(c.Priority),
 		Status:      domain.NewStatus(c.Status),
 		DueDate:     c.DueDate,
 		UserID:      c.UserID,
@@ -65,6 +128,16 @@ func fromCacheTask(c cacheTask) domain.Task {
 		TagName:     c.TagName,
 		CreatedAt:   c.CreatedAt,
 	}
+	for _, s := range c.Subtasks {
+		t.Subtasks = append(t.Subtasks, domain.Subtask{
+			ID:     s.ID,
+			TaskID: s.TaskID,
+			Title:  s.Title,
+			IsDone: s.IsDone,
+			Order:  s.Order,
+		})
+	}
+	return t
 }
 
 func (r *repo) SetTask(ctx context.Context, task domain.Task) error {
@@ -102,7 +175,7 @@ func (r *repo) DeleteTask(ctx context.Context, id string) error {
 	return r.client.Del(ctx, fmt.Sprintf("task:%s", id)).Err()
 }
 
-func (r *repo) GetList(ctx context.Context, key string) ([]domain.Task, error) {
+func (r *repo) GetList(ctx context.Context, key string) ([]model.TaskList, error) {
 	data, err := r.client.Get(ctx, key).Result()
 	if err != nil {
 		if errors.Is(err, redis3.Nil) {
@@ -110,21 +183,23 @@ func (r *repo) GetList(ctx context.Context, key string) ([]domain.Task, error) {
 		}
 		return nil, err
 	}
-	var cached []cacheTask
+	// Десериализуем в cacheListTasks (lowercase json-ключи), а не в model.TaskList
+	// (у которого нет json-тегов — Go использует PascalCase, ключи не совпадут).
+	var cached []cacheListTasks
 	if err := json.Unmarshal([]byte(data), &cached); err != nil {
 		return nil, fmt.Errorf("deserialize cached tasks: %w", err)
 	}
-	tasks := make([]domain.Task, len(cached))
+	tasks := make([]model.TaskList, len(cached))
 	for i, c := range cached {
-		tasks[i] = fromCacheTask(c)
+		tasks[i] = fromCacheListTasks(c)
 	}
 	return tasks, nil
 }
 
-func (r *repo) SetList(ctx context.Context, key string, tasks []domain.Task) error {
-	cached := make([]cacheTask, len(tasks))
+func (r *repo) SetList(ctx context.Context, key string, tasks []model.TaskList) error {
+	cached := make([]cacheListTasks, len(tasks))
 	for i, t := range tasks {
-		cached[i] = toCacheTask(t)
+		cached[i] = toCacheListTasks(t)
 	}
 	data, err := json.Marshal(cached)
 	if err != nil {
@@ -156,6 +231,59 @@ func (r *repo) InvalidateUserLists(ctx context.Context, userID string) error {
 		return nil
 	}
 	return r.client.Del(ctx, append(keys, userListSetKey)...).Err()
+}
+
+// InvalidateUserTaskCaches удаляет кэши всех задач пользователя.
+// Читает user_tasks:{userID} SET (заполняется в SetTask), удаляет task:{id} для каждой
+// задачи и сам tracking-SET. Надёжнее tag_tasks:{tagID}, т.к. заполняется всегда.
+func (r *repo) InvalidateUserTaskCaches(ctx context.Context, userID string) error {
+	userKey := fmt.Sprintf("user_tasks:%s", userID)
+
+	taskIDs, err := r.client.SMembers(ctx, userKey).Result()
+	if err != nil {
+		if errors.Is(err, redis3.Nil) {
+			return nil
+		}
+		return fmt.Errorf("get user_tasks members: %w", err)
+	}
+	if len(taskIDs) == 0 {
+		return nil
+	}
+
+	keys := make([]string, 0, len(taskIDs)+1)
+	for _, id := range taskIDs {
+		keys = append(keys, fmt.Sprintf("task:%s", id))
+	}
+	keys = append(keys, userKey)
+
+	return r.client.Del(ctx, keys...).Err()
+}
+
+// InvalidateTagTasks удаляет кэши всех задач, у которых tag_id = tagID.
+// Механизм: в SetTask мы добавляем task.ID в SET "tag_tasks:{tagID}".
+// Здесь читаем этот SET и удаляем ключи "task:{taskID}" + сам tracking-SET.
+func (r *repo) InvalidateTagTasks(ctx context.Context, tagID string) error {
+	tagKey := fmt.Sprintf("tag_tasks:%s", tagID)
+
+	taskIDs, err := r.client.SMembers(ctx, tagKey).Result()
+	if err != nil {
+		if errors.Is(err, redis3.Nil) {
+			return nil
+		}
+		return fmt.Errorf("get tag_tasks members: %w", err)
+	}
+	if len(taskIDs) == 0 {
+		return nil
+	}
+
+	// Формируем ключи "task:{id}" для каждой задачи с этим тегом
+	keys := make([]string, 0, len(taskIDs)+1)
+	for _, id := range taskIDs {
+		keys = append(keys, fmt.Sprintf("task:%s", id))
+	}
+	keys = append(keys, tagKey) // удаляем и сам tracking-SET
+
+	return r.client.Del(ctx, keys...).Err()
 }
 
 // userListKey извлекает ключ tracking-сета из cache key формата "tasks:user:<id>[;...]".

@@ -40,7 +40,7 @@ func PayloadToTask(p TaskPayload) domain.Task {
 		ID:          p.ID,
 		Title:       p.Title,
 		Description: p.Description,
-		Priority:    p.Priority,
+		Priority:    domain.Priory(p.Priority),
 		Status:      domain.NewStatus(p.Status),
 		DueDate:     p.DueDate,
 		UserID:      p.UserID,

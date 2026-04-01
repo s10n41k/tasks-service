@@ -6,6 +6,11 @@ import (
 	"time"
 )
 
+// SubtaskInput — подзадача при создании задачи.
+type SubtaskInput struct {
+	Title string `json:"title"`
+}
+
 // CreateTaskRequest — входные данные создания задачи (только json: теги).
 type CreateTaskRequest struct {
 	Title       string
@@ -15,17 +20,19 @@ type CreateTaskRequest struct {
 	DueDate     time.Time
 	TagID       *string
 	TagName     string
+	Subtasks    []SubtaskInput
 }
 
 func (r *CreateTaskRequest) UnmarshalJSON(data []byte) error {
 	var a struct {
-		Title       string  `json:"title"`
-		Description string  `json:"description"`
-		Priority    string  `json:"priory"`
-		Status      string  `json:"status"`
-		DueDate     string  `json:"due_date"`
-		TagID       *string `json:"tag_id,omitempty"`
-		TagName     string  `json:"tag_name"`
+		Title       string         `json:"title"`
+		Description string         `json:"description"`
+		Priority    string         `json:"priory"`
+		Status      string         `json:"status"`
+		DueDate     string         `json:"due_date"`
+		TagID       *string        `json:"tag_id,omitempty"`
+		TagName     string         `json:"tag_name"`
+		Subtasks    []SubtaskInput `json:"subtasks"`
 	}
 	if err := json.Unmarshal(data, &a); err != nil {
 		return err
@@ -41,6 +48,7 @@ func (r *CreateTaskRequest) UnmarshalJSON(data []byte) error {
 	r.DueDate = t
 	r.TagID = a.TagID
 	r.TagName = a.TagName
+	r.Subtasks = a.Subtasks
 	return nil
 }
 
@@ -54,17 +62,26 @@ type UpdateTaskRequest struct {
 	TagName     *string     `json:"tag_name"`
 }
 
+// SubtaskResponse — подзадача в HTTP-ответе.
+type SubtaskResponse struct {
+	ID     string `json:"id"`
+	Title  string `json:"title"`
+	IsDone bool   `json:"is_done"`
+	Order  int    `json:"order"`
+}
+
 // TaskResponse — HTTP-ответ по задаче (форматированные даты).
 type TaskResponse struct {
-	ID          string `json:"id"`
-	Title       string `json:"title"`
-	Description string `json:"description"`
-	Priority    string `json:"priory"`
-	Status      string `json:"status"`
-	DueDate     string `json:"due_date"`
-	CreatedAt   string `json:"created_at"`
-	UserID      string `json:"user_id"`
-	TagName     string `json:"tags_name"`
+	ID          string            `json:"id"`
+	Title       string            `json:"title"`
+	Description string            `json:"description"`
+	Priority    string            `json:"priory"`
+	Status      string            `json:"status"`
+	DueDate     string            `json:"due_date"`
+	CreatedAt   string            `json:"created_at"`
+	UserID      string            `json:"user_id"`
+	TagName     string            `json:"tags_name"`
+	Subtasks    []SubtaskResponse `json:"subtasks,omitempty"`
 }
 
 // CustomTime десериализует формат "2006-01-02 15:04".

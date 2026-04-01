@@ -14,3 +14,11 @@ type TaskCommandService interface {
 	DeleteTask(ctx context.Context, id string) error
 	DeleteTaskBatch(ctx context.Context, ids []string) error
 }
+
+// SubtaskService — операции над подзадачами обычных задач.
+type SubtaskService interface {
+	AddSubtask(ctx context.Context, taskID, ownerID, title string) (domain.Subtask, error)
+	ToggleSubtaskDone(ctx context.Context, subtaskID, taskOwnerID string) (domain.Subtask, error)
+	DeleteSubtask(ctx context.Context, subtaskID, taskOwnerID string) error
+	UpdateSubtask(ctx context.Context, subtaskID, taskOwnerID, title string) error
+}

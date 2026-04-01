@@ -57,6 +57,11 @@ func (s *Service) SetTagList(ctx context.Context, cacheKey string, tags []model3
 	return s.repositoryRedis.SetTagToCacheList(ctx, cacheKey, tags)
 }
 
+// InvalidateTagListCache сбрасывает кэш списка тегов пользователя.
+func (s *Service) InvalidateTagListCache(ctx context.Context, userID string) error {
+	return s.repositoryRedis.DeleteTagListCache(ctx, userID)
+}
+
 func (s *Service) UpdateTags(ctx context.Context, id string, tags model3.TagsDTO, userID string) error {
 	ok, _ := s.repositoryPostgres.FindTagByID(ctx, id)
 	if !ok {

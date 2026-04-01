@@ -1,6 +1,7 @@
 package config
 
 import (
+	"log"
 	"os"
 	"strings"
 )
@@ -28,9 +29,16 @@ type Config struct {
 		Brokers []string
 		GroupID string
 	}
-	JWTSecret     string
-	GatewaySecret string
-	GatewaySign   string
+	Gateway struct {
+		Host string
+		Port string
+	}
+	UsersService struct {
+		Host string
+		Port string
+	}
+	JWTSecret   string
+	GatewaySign string
 }
 
 func GetConfig() (*Config, error) {
@@ -59,9 +67,17 @@ func GetConfig() (*Config, error) {
 	cfg.Kafka.Brokers = strings.Split(brokers, ",")
 	cfg.Kafka.GroupID = getEnv("KAFKA_GROUP_TASKS", "tasks-service-group")
 
-	// Secrets
-	cfg.JWTSecret = getEnv("JWT_SECRET", "uYk3Pq7RvA1wXzJ5LmN9tBcDfGhJkMnP2S4V6Y8ZaCd")
-	cfg.GatewaySecret = getEnv("GATEWAY_SIGN", "68b329da9893e34099c7d8ad5cb9c940")
+	// Gateway (для notification client)
+	cfg.Gateway.Host = getEnv("GATEWAY_HOST", "gateway")
+	cfg.Gateway.Port = getEnv("GATEWAY_PORT", "8080")
+
+	// Users service (для авто-сообщений при изменении совместных задач)
+	cfg.UsersService.Host = getEnv("USERS_SERVICE_HOST", "users-service")
+	cfg.UsersService.Port = getEnv("USERS_SERVICE_PORT", "8001")
+
+	// Секреты — обязательные переменные окружения, дефолты недопустимы
+	cfg.JWTSecret = requireEnv("JWT_SECRET")
+	cfg.GatewaySign = requireEnv("GATEWAY_SIGN")
 
 	return cfg, nil
 }
@@ -71,4 +87,13 @@ func getEnv(key, defaultValue string) string {
 		return value
 	}
 	return defaultValue
+}
+
+// requireEnv возвращает значение env-переменной или завершает процесс с ошибкой.
+func requireEnv(key string) string {
+	v := os.Getenv(key)
+	if v == "" {
+		log.Fatalf("обязательная переменная окружения %s не задана", key)
+	}
+	return v
 }
