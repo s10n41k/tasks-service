@@ -10,7 +10,9 @@ import (
 	"TODOLIST_Tasks/app/pkg/logging"
 	"TODOLIST_Tasks/app/pkg/utils/operator"
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -176,6 +178,9 @@ func (r *repo) FindByID(ctx context.Context, id string) (domain.Task, error) {
 	)
 	if err != nil {
 		r.logger.Errorf("FindByID: scan task %s: %v", id, err)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.Task{}, sql.ErrNoRows
+		}
 		return domain.Task{}, err
 	}
 
@@ -567,7 +572,7 @@ func (r *repo) Update(ctx context.Context, id string, patch port.UpdatePatch) (d
 	var m TaskModel
 	var status string
 	err = tx.QueryRow(ctx, `
-		SELECT t.task_id, t.title, t.description, t.status, t.priory, t.due_date, t.user_id, t.tag_id, t.created_at,
+		SELECT t.task_id, t.title, t.description, t.status::TEXT, t.priory, t.due_date, t.user_id, t.tag_id, t.created_at,
 		       COALESCE(dt.name, ct.name) AS tags_name
 		FROM tasks t
 		LEFT JOIN custom_tag ct ON t.tag_id = ct.tag_id

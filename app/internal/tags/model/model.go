@@ -1,7 +1,7 @@
 package model
 
 type Tags struct {
-	Id     string
-	Name   string
-	UserID *string
+	Id     string  `json:"id"`
+	Name   string  `json:"name"`
+	UserID *string `json:"user_id,omitempty"`
 }
