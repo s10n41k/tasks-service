@@ -299,9 +299,9 @@ func (h *handler) UpdateTag(w http.ResponseWriter, r *http.Request) error {
 
 	h.logger.Infof("tag with ID %s updated successfully", tagId)
 
-	response := map[string]string{"message": "successful update"}
+	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(response)
+	json.NewEncoder(w).Encode(map[string]string{"id": tagId, "name": tagRequest.Name})
 
 	go func(tagId string, userId string, tagRequest model.TagsDTO) {
 		bgCtx, bgCancel := context.WithTimeout(context.Background(), goroutineTimeout)

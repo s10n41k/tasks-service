@@ -621,7 +621,7 @@ func (h *Handler) UpdateTaskSubtask(w http.ResponseWriter, r *http.Request) erro
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return nil
 	}
-	w.WriteHeader(http.StatusNoContent)
+	w.WriteHeader(http.StatusOK)
 	return nil
 }
 
