@@ -23,7 +23,6 @@ CREATE INDEX idx_outbox_events_pending
     ON outbox_events(created_at, processed_at)
     INCLUDE (aggregate_type, event_type, aggregate_id, attempts)
     WHERE processed_at IS NULL
-    AND created_at > NOW() - INTERVAL '30 days'
     AND attempts < 10;
 
 -- BRIN для исторических данных (если таблица > 1M записей)
