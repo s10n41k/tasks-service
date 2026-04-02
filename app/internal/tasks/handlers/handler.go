@@ -313,8 +313,9 @@ func (h *Handler) Update(w http.ResponseWriter, r *http.Request) error {
 		return nil
 	}
 
+	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]string{"message": "successful update"})
+	json.NewEncoder(w).Encode(entityToResponse(task))
 
 	select {
 	case h.redisSema <- struct{}{}:
