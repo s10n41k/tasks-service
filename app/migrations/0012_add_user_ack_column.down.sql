@@ -1,0 +1,2 @@
+ALTER TABLE tasks DROP COLUMN IF EXISTS user_ack;
+ALTER TABLE shared_tasks DROP COLUMN IF EXISTS user_ack;

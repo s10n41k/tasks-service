@@ -86,8 +86,9 @@ func (h *handler) CreateTag(w http.ResponseWriter, r *http.Request) error {
 
 	h.logger.Infof("tag created successfully with id: %s", result)
 
+	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
-	w.Write([]byte(fmt.Sprintf("Tag created: %s", result)))
+	json.NewEncoder(w).Encode(map[string]string{"id": result, "name": tag.Name})
 
 	go func(tag model.Tags, userId string) {
 		bgCtx, bgCancel := context.WithTimeout(context.Background(), goroutineTimeout)

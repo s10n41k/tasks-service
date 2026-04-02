@@ -28,7 +28,7 @@ func proposeSharedTask(t *testing.T) string {
 	path := fmt.Sprintf("/v1/users/%s/shared-tasks", testUserID)
 	req := signedReq(t, http.MethodPost, path, testUserID, body)
 	resp := do(t, req)
-	require.Equal(t, http.StatusCreated, resp.StatusCode, readBody(resp))
+	require.Equal(t, http.StatusCreated, resp.StatusCode)
 
 	var result map[string]string
 	decodeJSON(t, resp, &result)
