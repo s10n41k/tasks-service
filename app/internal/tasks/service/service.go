@@ -31,6 +31,10 @@ func New(tasks port.TaskRepository, subtasks port.SubtaskRepository, cache port.
 
 // --- TaskCommandService ---
 
+func (s *taskService) CountActiveTasks(ctx context.Context, userID string) (int, error) {
+	return s.tasks.CountActive(ctx, userID)
+}
+
 func (s *taskService) CreateTask(ctx context.Context, task domain.Task) error {
 	if err := s.tasks.Create(ctx, task); err != nil {
 		s.logger.Errorf("CreateTask: task %s user %s: %v", task.ID, task.UserID, err)

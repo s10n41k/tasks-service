@@ -1,6 +1,13 @@
 package domain
 
-import "time"
+import (
+	"errors"
+	"time"
+)
+
+const MaxActiveTasks = 100
+
+var ErrActiveLimitReached = errors.New("превышен лимит активных задач (100)")
 
 type Status string
 

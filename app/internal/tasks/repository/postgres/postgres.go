@@ -35,6 +35,18 @@ func NewSubtaskRepository(db postgresql.Client, logger logging.Logger) port.Subt
 	return &repo{db: db, logger: logger}
 }
 
+func (r *repo) CountActive(ctx context.Context, userID string) (int, error) {
+	var count int
+	err := r.db.QueryRow(ctx, `
+		SELECT COUNT(*) FROM tasks
+		WHERE user_id = $1 AND status IN (1, 2) AND admin_deleted = FALSE
+	`, userID).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("count active tasks: %w", err)
+	}
+	return count, nil
+}
+
 func (r *repo) Create(ctx context.Context, task domain.Task) error {
 	eventData, err := json.Marshal(toTaskPayload(task))
 	if err != nil {

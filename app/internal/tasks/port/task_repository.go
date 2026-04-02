@@ -17,6 +17,8 @@ var (
 
 // TaskRepository — контракт хранилища задач.
 type TaskRepository interface {
+	// CountActive возвращает число активных (не завершённых) задач пользователя.
+	CountActive(ctx context.Context, userID string) (int, error)
 	Create(ctx context.Context, task domain.Task) error
 	CreateBatch(ctx context.Context, tasks []domain.Task) error
 	Update(ctx context.Context, id string, patch UpdatePatch) (domain.Task, error)

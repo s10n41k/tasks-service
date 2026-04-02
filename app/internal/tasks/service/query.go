@@ -12,6 +12,7 @@ import (
 type TaskQueryService interface {
 	// FindTask возвращает задачу и флаг fromCache: true — из Redis, false — из БД.
 	FindTask(ctx context.Context, id string) (domain.Task, bool, error)
+	CountActiveTasks(ctx context.Context, userID string) (int, error)
 	FindTasksByUser(ctx context.Context, userID string, sortOpts sort.Options, filterOpts filter.Option) ([]model.TaskList, error)
 	FindTasksByTag(ctx context.Context, userID, tagID string) ([]model.TaskList, error)
 	AdminFindAllTasks(ctx context.Context) ([]model.TaskList, error)

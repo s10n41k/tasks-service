@@ -249,6 +249,22 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) error {
 
 	task := dtoToEntity(userID, req)
 
+	// Проверяем лимит активных задач
+	{
+		limitCtx, limitCancel := context.WithTimeout(r.Context(), 3*time.Second)
+		defer limitCancel()
+		count, err := h.query.CountActiveTasks(limitCtx, userID)
+		if err != nil {
+			h.logger.Errorf("Create: count active tasks user %s: %v", userID, err)
+			http.Error(w, "Failed to check task limit", http.StatusInternalServerError)
+			return nil
+		}
+		if count >= domain.MaxActiveTasks {
+			http.Error(w, "Достигнут лимит активных задач (100). Завершите некоторые задачи.", http.StatusUnprocessableEntity)
+			return nil
+		}
+	}
+
 	// Задачи с подзадачами вставляются синхронно (нельзя через batch — subtasks нужно вставить атомарно)
 	if task.HasSubtasks() {
 		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)

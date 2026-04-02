@@ -14,6 +14,11 @@ import (
 // TaskRepository — мок репозитория задач.
 type TaskRepository struct{ mock.Mock }
 
+func (m *TaskRepository) CountActive(ctx context.Context, userID string) (int, error) {
+	args := m.Called(ctx, userID)
+	return args.Int(0), args.Error(1)
+}
+
 func (m *TaskRepository) Create(ctx context.Context, task domain.Task) error {
 	return m.Called(ctx, task).Error(0)
 }
