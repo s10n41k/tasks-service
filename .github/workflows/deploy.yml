@@ -12,10 +12,19 @@ jobs:
     needs: []
 
     steps:
+      - name: Debug paths
+        env:
+          INFRA_PATH: ${{ secrets.INFRA_PATH }}
+        run: |
+          echo "INFRA_PATH=$INFRA_PATH"
+          echo "PWD=$(pwd)"
+          ls "$INFRA_PATH" || echo "DIR NOT FOUND"
+          which docker-compose || echo "docker-compose not found"
+          docker compose version || echo "docker compose not found"
+
       - name: Rebuild and restart
         env:
           INFRA_PATH: ${{ secrets.INFRA_PATH }}
         run: |
-          cd "$INFRA_PATH"
-          docker-compose build --no-cache tasks-service
-          docker-compose up -d tasks-service
+          docker compose -f "$INFRA_PATH/docker-compose.yml" --project-directory "$INFRA_PATH" build --no-cache tasks-service
+          docker compose -f "$INFRA_PATH/docker-compose.yml" --project-directory "$INFRA_PATH" up -d tasks-service
