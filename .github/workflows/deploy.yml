@@ -1,0 +1,21 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    name: Rebuild & restart tasks-service
+    runs-on: self-hosted
+    environment: production   # <-- здесь GitHub будет ждать апрув
+    needs: []
+
+    steps:
+      - name: Rebuild and restart
+        env:
+          INFRA_PATH: ${{ secrets.INFRA_PATH }}
+        run: |
+          cd "$INFRA_PATH"
+          docker-compose build --no-cache tasks-service
+          docker-compose up -d tasks-service
