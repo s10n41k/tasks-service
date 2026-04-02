@@ -1,0 +1,18 @@
+name: CD
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    name: Rebuild & restart tasks-service
+    runs-on: self-hosted
+
+    steps:
+      - name: Rebuild and restart
+        env:
+          INFRA_DIR: ${{ secrets.INFRA_DIR }}
+        run: |
+          docker compose -f "$INFRA_DIR/docker-compose.yml" --project-directory "$INFRA_DIR" build --no-cache tasks-service
+          docker compose -f "$INFRA_DIR/docker-compose.yml" --project-directory "$INFRA_DIR" up -d --no-deps tasks-service
